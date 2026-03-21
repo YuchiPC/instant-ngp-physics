@@ -1265,11 +1265,55 @@ void Testbed::imgui() {
 		}
 
 		if (m_testbed_mode == ETestbedMode::Volume && ImGui::TreeNode("Volume training options")) {
-			accum_reset |= ImGui::SliderFloat("Albedo", &m_volume.albedo, 0.f, 1.f);
-			accum_reset |= ImGui::SliderFloat("Scattering", &m_volume.scattering, -2.f, 2.f);
+			// === PHYSICS ON/OFF TOGGLE (for A/B comparison) ===
+			accum_reset |= ImGui::Checkbox("Enable Cloud Physics", &m_volume.enable_physics);
+			if (!m_volume.enable_physics) {
+				ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.0f, 1.0f), "Physics OFF: original rendering");
+			}
+
 			accum_reset |= ImGui::SliderFloat(
 				"Distance scale", &m_volume.inv_distance_scale, 1.f, 100.f, "%.3g", ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_NoRoundToFormat
 			);
+
+			if (m_volume.enable_physics) {
+				// === Auto-detected species info ===
+				if (!m_volume.detected_species_name.empty()) {
+					ImGui::Text("Detected species: %s", m_volume.detected_species_name.c_str());
+				}
+
+				if (ImGui::TreeNode("Cloud Microphysics")) {
+					if (m_volume.fractions_from_file) {
+						ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Initial mix set from grid name");
+					}
+					ImGui::Text("Hydrometeor Mix (auto-normalized):");
+					accum_reset |= ImGui::SliderFloat("Water droplets", &m_volume.phase_fractions[0], 0.f, 1.f);
+					accum_reset |= ImGui::SliderFloat("Ice crystals",   &m_volume.phase_fractions[1], 0.f, 1.f);
+					accum_reset |= ImGui::SliderFloat("Snow",           &m_volume.phase_fractions[2], 0.f, 1.f);
+					accum_reset |= ImGui::SliderFloat("Graupel",        &m_volume.phase_fractions[3], 0.f, 1.f);
+					float sum = m_volume.phase_fractions[0] + m_volume.phase_fractions[1] +
+					            m_volume.phase_fractions[2] + m_volume.phase_fractions[3];
+					if (sum > 0.0f) {
+						for (int i = 0; i < 4; i++) m_volume.phase_fractions[i] /= sum;
+					}
+					ImGui::Separator();
+					ImGui::Text("Manual Overrides (0 = use blended):");
+					accum_reset |= ImGui::SliderFloat("Albedo override",     &m_volume.albedo_override, 0.f, 1.f);
+					accum_reset |= ImGui::SliderFloat("HG g override",       &m_volume.g_override, -1.f, 1.f);
+					accum_reset |= ImGui::Checkbox("Dual-lobe phase fn",     &m_volume.use_dual_lobe);
+					ImGui::TreePop();
+				}
+
+				if (ImGui::TreeNode("Lighting & Scattering")) {
+					accum_reset |= ImGui::Checkbox("Direct sun lighting",    &m_volume.enable_direct_light);
+					accum_reset |= ImGui::SliderFloat("Sun intensity",       &m_volume.sun_intensity, 0.f, 100.f, "%.1f");
+					accum_reset |= ImGui::SliderInt("Shadow ray steps",      &m_volume.shadow_steps, 4, 128);
+					accum_reset |= ImGui::SliderInt("Multi-scatter octaves", &m_volume.ms_octaves, 0, 8);
+					accum_reset |= ImGui::SliderFloat("MS attenuation",      &m_volume.ms_attenuation, 0.1f, 1.f);
+					accum_reset |= ImGui::Checkbox("Beer-Powder edges",      &m_volume.enable_beer_powder);
+					ImGui::TreePop();
+				}
+			}
+
 			ImGui::TreePop();
 		}
 	}

@@ -977,9 +977,41 @@ public:
 	};
 
 	struct Volume {
-		float albedo = 0.95f;
-		float scattering = 0.f;
+		// --- Master physics toggle (false = original rendering for A/B comparison) ---
+		bool  enable_physics = true;
+
+		// --- Hydrometeor mix fractions [water, ice, snow, graupel] ---
+		// Auto-set from NanoVDB grid names on load. Must sum to 1.0.
+		float phase_fractions[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+		bool  fractions_from_file = false; // true if auto-detected from .nvdb
+
+		// --- Overrides (when > 0 these replace the blended value) ---
+		float albedo_override = 0.0f;    // 0 = use blended, otherwise override
+		float g_override      = 0.0f;    // 0 = use blended HG g
+
+		// Legacy parameters (kept for backward compat; derived from blend if not overridden)
+		float albedo = 0.9999f;
+		float scattering = 0.85f;        // now interpreted as HG g parameter
 		float inv_distance_scale = 100.f;
+
+		// --- Sun / direct lighting ---
+		float sun_intensity   = 20.0f;   // multiplier on sun radiance
+		int   shadow_steps    = 32;      // steps for shadow ray march toward sun
+		bool  enable_direct_light = true;
+
+		// --- Multi-scattering (Frostbite octave method) ---
+		int   ms_octaves      = 4;       // number of scattering octaves
+		float ms_attenuation  = 0.5f;    // per-octave extinction/phase attenuation
+
+		// --- Beer-Powder edge darkening ---
+		bool  enable_beer_powder = true;
+
+		// --- Phase function mode ---
+		bool  use_dual_lobe   = true;    // true = dual-lobe HG, false = single-lobe
+
+		// --- Species auto-detection (from NanoVDB grid name) ---
+		std::string detected_species_name; // for display in UI
+
 		GPUMemory<char> nanovdb_grid;
 		GPUMemory<uint8_t> bitgrid;
 		float global_majorant = 1.f;

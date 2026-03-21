@@ -29,6 +29,7 @@
 
 #include <filesystem/path.h>
 
+#include <cstring>
 #include <fstream>
 
 namespace ngp {
@@ -58,13 +59,120 @@ __device__ vec4 proc_envmap(const vec3& dir, const vec3& up_dir, const vec3& sun
 }
 
 __device__ vec4 proc_envmap_render(const vec3& dir, const vec3& up_dir, const vec3& sun_dir, const vec3& skycol) {
-	// Constant background color. Uncomment the following two lines to instead render the
-	// actual sunsky model that we trained from.
 	vec4 result = vec4(0.0f);
-
 	result = proc_envmap(dir, up_dir, sun_dir, skycol);
-
 	return result;
+}
+
+// ============================================================================
+// Shadow ray: march toward sun accumulating optical depth, return transmittance
+// Used for direct illumination at each scattering event.
+// ============================================================================
+__device__ float march_to_sun(
+	vec3 pos,
+	const vec3& sun_dir,
+	const BoundingBox& aabb,
+	const nanovdb::FloatGrid* grid,
+	const vec3& world2index_offset,
+	float world2index_scale,
+	float sigma_t_scale,
+	int max_steps
+) {
+	float tau = 0.0f;
+	float diag = length(aabb.diag());
+	float dt = diag / (float)max_steps;
+
+	auto acc = grid->tree().getAccessor();
+	for (int i = 0; i < max_steps; i++) {
+		pos += sun_dir * dt;
+		if (!aabb.contains(pos)) break;
+		vec3 nanovdbpos = pos * world2index_scale + world2index_offset;
+		float density = acc.getValue({(int)nanovdbpos.x, (int)nanovdbpos.y, (int)nanovdbpos.z});
+		tau += fmaxf(density, 0.0f) * dt * sigma_t_scale;
+	}
+	return expf(-tau);
+}
+
+// ============================================================================
+// Compute in-scattered radiance at a point using multi-scattering octave method
+// (Wrenninge / Frostbite SIGGRAPH 2016)
+//
+// For each octave n:
+//   sigma_t is attenuated by a^n (medium appears more transparent)
+//   phase g is attenuated by c^n (scattering becomes more isotropic)
+// This approximates how multiply-scattered light sees a "softer" medium.
+// ============================================================================
+__device__ vec3 compute_inscattered_radiance(
+	const vec3& pos,
+	const vec3& view_dir,
+	const vec3& sun_dir,
+	const vec3& sun_color,
+	float sun_intensity,
+	float density,
+	float sigma_t_scale,
+	const HydrometeorProps& props,
+	bool use_dual_lobe,
+	bool enable_beer_powder,
+	int ms_octaves,
+	float ms_attenuation,
+	const BoundingBox& aabb,
+	const nanovdb::FloatGrid* grid,
+	const vec3& world2index_offset,
+	float world2index_scale,
+	int shadow_steps,
+	const vec3& sky_col,
+	const vec3& up_dir
+) {
+	float cos_theta = dot(view_dir, sun_dir);
+
+	// Compute transmittance toward sun (shared across octaves)
+	float T_sun = march_to_sun(pos, sun_dir, aabb, grid, world2index_offset,
+	                           world2index_scale, sigma_t_scale, shadow_steps);
+
+	// Ambient sky approximation: fraction of light from sky hemisphere
+	// Use a cheap vertical transmittance estimate
+	float ambient_factor = 0.15f; // ambient-to-direct ratio
+
+	vec3 L_total = vec3(0.0f);
+	float sigma_t_ms = density * sigma_t_scale;
+	float g1_ms = props.g1;
+	float g2_ms = props.g2;
+
+	for (int octave = 0; octave < ms_octaves; octave++) {
+		// Phase function at this octave's effective g
+		float phase;
+		if (use_dual_lobe) {
+			phase = dual_lobe_hg(cos_theta, g1_ms, g2_ms, props.w_g1);
+		} else {
+			phase = henyey_greenstein(cos_theta, g1_ms);
+		}
+
+		// Sun transmittance at this octave's effective extinction
+		float att_n = (octave == 0) ? 1.0f : powf(ms_attenuation, (float)octave);
+		float T_sun_ms = powf(T_sun, att_n); // equivalent to exp(-sigma_t_ms * sun_optical_depth)
+
+		// Beer-Powder: modulate to darken thin cloud edges
+		float energy = 1.0f;
+		if (enable_beer_powder && sigma_t_ms > 0.0f) {
+			energy = beer_powder(sigma_t_ms * 0.1f); // 0.1 is a tunable local-thickness proxy
+		}
+
+		// Direct sun contribution at this octave
+		vec3 L_sun = sun_color * sun_intensity * phase * T_sun_ms * props.albedo * energy;
+
+		// Ambient sky contribution (isotropic phase = 1/4pi)
+		float ambient_phase = 1.0f / (4.0f * PI());
+		vec3 L_ambient = sky_col * ambient_phase * ambient_factor * att_n;
+
+		L_total += L_sun + L_ambient;
+
+		// Attenuate for next octave
+		sigma_t_ms *= ms_attenuation;
+		g1_ms *= ms_attenuation;
+		g2_ms *= ms_attenuation;
+	}
+
+	return L_total;
 }
 
 __device__ inline bool
@@ -106,7 +214,17 @@ __global__ void volume_generate_training_data_kernel(
 	float global_majorant,
 	vec3 up_dir,
 	vec3 sun_dir,
-	vec3 sky_col
+	vec3 sky_col,
+	// Physics parameters
+	float sun_intensity,
+	int shadow_steps,
+	int ms_octaves,
+	float ms_attenuation,
+	bool enable_direct_light,
+	bool enable_beer_powder,
+	bool use_dual_lobe,
+	HydrometeorProps hydro_props,
+	bool enable_physics // master toggle
 ) {
 	uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
 	if (idx >= n_elements) {
@@ -116,9 +234,14 @@ __global__ void volume_generate_training_data_kernel(
 	uint32_t numout = 0;
 	vec3 outpos[MAX_TRAIN_VERTICES];
 	float outdensity[MAX_TRAIN_VERTICES];
+	vec3 outradiance[MAX_TRAIN_VERTICES];
 	float scale = distance_scale / global_majorant;
 	const nanovdb::FloatGrid* grid = reinterpret_cast<const nanovdb::FloatGrid*>(nanovdb);
 	auto acc = grid->tree().getAccessor();
+
+	vec3 sun_color = vec3{1.0f, 0.95f, 0.85f};
+	float effective_albedo = enable_physics ? hydro_props.albedo : albedo;
+
 	while (numout < MAX_TRAIN_VERTICES) {
 		uint32_t prev_numout = numout;
 		vec3 pos = random_dir(rng) * 2.0f + 0.5f;
@@ -129,7 +252,7 @@ __global__ void volume_generate_training_data_kernel(
 		pos = pos + (t + 1e-6f) * dir;
 		float throughput = 1.f;
 		for (int iter = 0; iter < 128; ++iter) {
-			if (!walk_to_next_event(rng, aabb, pos, dir, bitgrid, scale)) { // escaped!
+			if (!walk_to_next_event(rng, aabb, pos, dir, bitgrid, scale)) {
 				break;
 			}
 			vec3 nanovdbpos = pos * world2index_scale + world2index_offset;
@@ -140,30 +263,48 @@ __global__ void volume_generate_training_data_kernel(
 			if (numout < MAX_TRAIN_VERTICES) {
 				outdensity[numout] = density;
 				outpos[numout] = pos;
+				if (enable_physics && enable_direct_light && density > 0.001f) {
+					outradiance[numout] = compute_inscattered_radiance(
+						pos, dir, sun_dir, sun_color, sun_intensity,
+						density, global_majorant, hydro_props, use_dual_lobe,
+						enable_beer_powder, ms_octaves, ms_attenuation,
+						aabb, grid, world2index_offset, world2index_scale,
+						shadow_steps, sky_col, up_dir
+					);
+				} else {
+					outradiance[numout] = vec3(0.0f);
+				}
 				numout++;
 			}
 
 			float extinction_prob = density / global_majorant;
-			float scatter_prob = extinction_prob * albedo;
+			float scatter_prob = extinction_prob * effective_albedo;
 			float zeta2 = random_val(rng);
 			if (zeta2 >= extinction_prob) {
 				continue; // null collision
 			}
-			if (zeta2 < scatter_prob) { // was it a scatter?
-				dir = normalize(dir * scattering + random_dir(rng));
+			if (zeta2 < scatter_prob) {
+				if (enable_physics) {
+					dir = sample_dual_lobe_hg(dir, hydro_props, rng);
+				} else {
+					dir = normalize(random_dir(rng)); // original isotropic
+				}
 			} else {
 				throughput = 0.f; // absorb
 				break;
 			}
 		}
-		vec4 targetcol = proc_envmap(dir, up_dir, sun_dir, sky_col) * throughput;
+		vec4 envcolor = proc_envmap(dir, up_dir, sun_dir, sky_col) * throughput;
 		uint32_t oidx = idx * MAX_TRAIN_VERTICES;
 		for (uint32_t i = prev_numout; i < numout; ++i) {
-			float density = outdensity[i];
-			vec3 pos = outpos[i];
-			pos_out[oidx + i] = pos;
-			target_out[oidx + i] = targetcol;
-			target_out[oidx + i].w = density;
+			pos_out[oidx + i] = outpos[i];
+			if (enable_physics) {
+				vec3 combined_rgb = envcolor.rgb() + outradiance[i];
+				target_out[oidx + i] = vec4(combined_rgb, outdensity[i]);
+			} else {
+				target_out[oidx + i] = envcolor;
+				target_out[oidx + i].w = outdensity[i];
+			}
 		}
 	}
 }
@@ -184,6 +325,14 @@ void Testbed::train_volume(size_t target_batch_size, bool get_loss_scalar, cudaS
 	float distance_scale = 1.f / std::max(m_volume.inv_distance_scale, 0.01f);
 	auto sky_col = m_background_color.rgb();
 
+	// Compute blended hydrometeor properties from phase fractions
+	HydrometeorProps hydro_props = blend_hydrometeor_props(m_volume.phase_fractions);
+	if (m_volume.albedo_override > 0.0f) hydro_props.albedo = m_volume.albedo_override;
+	if (m_volume.g_override != 0.0f) { hydro_props.g1 = m_volume.g_override; hydro_props.g2 = -m_volume.g_override * 0.35f; }
+
+	// When physics disabled, use original defaults for training
+	float train_albedo = m_volume.enable_physics ? hydro_props.albedo : 0.95f;
+
 	linear_kernel(
 		volume_generate_training_data_kernel,
 		0,
@@ -197,13 +346,22 @@ void Testbed::train_volume(size_t target_batch_size, bool get_loss_scalar, cudaS
 		m_volume.world2index_scale,
 		m_render_aabb,
 		m_rng,
-		m_volume.albedo,
-		m_volume.scattering,
+		train_albedo,
+		hydro_props.g1,
 		distance_scale,
 		m_volume.global_majorant,
 		m_up_dir,
 		m_sun_dir,
-		sky_col
+		sky_col,
+		m_volume.sun_intensity,
+		m_volume.shadow_steps,
+		m_volume.ms_octaves,
+		m_volume.ms_attenuation,
+		m_volume.enable_direct_light,
+		m_volume.enable_beer_powder,
+		m_volume.use_dual_lobe,
+		hydro_props,
+		m_volume.enable_physics
 	);
 	m_rng.advance(n_elements * 256);
 
@@ -316,8 +474,18 @@ __global__ void volume_render_kernel_gt(
 	float world2index_scale,
 	float distance_scale,
 	float albedo,
-	float scattering,
-	vec4* __restrict__ frame_buffer
+	float scattering, // HG g when physics enabled; blend factor when disabled
+	vec4* __restrict__ frame_buffer,
+	// Physics parameters
+	float sun_intensity,
+	int shadow_steps,
+	int ms_octaves,
+	float ms_attenuation,
+	bool enable_direct_light,
+	bool enable_beer_powder,
+	bool use_dual_lobe,
+	HydrometeorProps hydro_props,
+	bool enable_physics // master toggle
 ) {
 	uint32_t idx = threadIdx.x + blockDim.x * blockIdx.x;
 	if (idx >= n_pixels || idx >= pixel_counter_in[0]) {
@@ -336,41 +504,89 @@ __global__ void volume_render_kernel_gt(
 	const nanovdb::FloatGrid* grid = reinterpret_cast<const nanovdb::FloatGrid*>(nanovdb);
 	auto acc = grid->tree().getAccessor();
 
-	// ye olde delta tracker
 	float scale = distance_scale / global_majorant;
 
 	bool absorbed = false;
 	bool scattered = false;
 
-	for (int iter = 0; iter < 128; ++iter) {
-		vec3 nanovdbpos = pos * world2index_scale + world2index_offset;
-		float density =
-			acc.getValue({int(nanovdbpos.x + random_val(rng)), int(nanovdbpos.y + random_val(rng)), int(nanovdbpos.z + random_val(rng))});
-		float extinction_prob = density / global_majorant;
-		float scatter_prob = extinction_prob * albedo;
-		float zeta2 = random_val(rng);
-		if (zeta2 < scatter_prob) {
-			dir = normalize(dir * scattering + random_dir(rng));
-			scattered = true;
-		} else if (zeta2 < extinction_prob) {
-			absorbed = true;
-			break;
+	if (!enable_physics) {
+		// ===== ORIGINAL RENDERING (no physics) =====
+		for (int iter = 0; iter < 128; ++iter) {
+			vec3 nanovdbpos = pos * world2index_scale + world2index_offset;
+			float density =
+				acc.getValue({int(nanovdbpos.x + random_val(rng)), int(nanovdbpos.y + random_val(rng)), int(nanovdbpos.z + random_val(rng))});
+			float extinction_prob = density / global_majorant;
+			float scatter_prob = extinction_prob * albedo;
+			float zeta2 = random_val(rng);
+			if (zeta2 < scatter_prob) {
+				dir = normalize(random_dir(rng)); // isotropic scattering (original)
+				scattered = true;
+			} else if (zeta2 < extinction_prob) {
+				absorbed = true;
+				break;
+			}
+			if (!walk_to_next_event(rng, aabb, pos, dir, bitgrid, scale)) {
+				break;
+			}
 		}
-		if (!walk_to_next_event(rng, aabb, pos, dir, bitgrid, scale)) {
-			break;
+		vec4 col;
+		if (absorbed) {
+			col = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+		} else if (scattered) {
+			col = proc_envmap(dir, up_dir, sun_dir, sky_col);
+		} else {
+			col = proc_envmap_render(dir, up_dir, sun_dir, sky_col);
 		}
-	}
-	// the ray is done!
-
-	vec4 col;
-	if (absorbed) {
-		col = {0.0f, 0.0f, 0.0f, 1.0f};
-	} else if (scattered) {
-		col = proc_envmap(dir, up_dir, sun_dir, sky_col);
+		frame_buffer[pixidx] = col;
 	} else {
-		col = proc_envmap_render(dir, up_dir, sun_dir, sky_col);
+		// ===== PHYSICS-BASED RENDERING =====
+		vec3 sun_color = vec3{1.0f, 0.95f, 0.85f};
+		vec3 accumulated_radiance = vec3(0.0f);
+		float transmittance = 1.0f;
+
+		for (int iter = 0; iter < 128; ++iter) {
+			vec3 nanovdbpos = pos * world2index_scale + world2index_offset;
+			float density =
+				acc.getValue({int(nanovdbpos.x + random_val(rng)), int(nanovdbpos.y + random_val(rng)), int(nanovdbpos.z + random_val(rng))});
+			float extinction_prob = density / global_majorant;
+			float scatter_prob = extinction_prob * hydro_props.albedo;
+			float zeta2 = random_val(rng);
+			if (zeta2 < scatter_prob) {
+				// Compute direct illumination before changing direction
+				if (enable_direct_light && density > 0.001f) {
+					vec3 L_inscatter = compute_inscattered_radiance(
+						pos, dir, sun_dir, sun_color, sun_intensity,
+						density, global_majorant, hydro_props, use_dual_lobe,
+						enable_beer_powder, ms_octaves, ms_attenuation,
+						aabb, grid, world2index_offset, world2index_scale,
+						shadow_steps, sky_col, up_dir
+					);
+					accumulated_radiance += transmittance * L_inscatter;
+				}
+				transmittance *= hydro_props.albedo;
+
+				// HG phase function sampling
+				dir = sample_dual_lobe_hg(dir, hydro_props, rng);
+				scattered = true;
+			} else if (zeta2 < extinction_prob) {
+				absorbed = true;
+				break;
+			}
+			if (!walk_to_next_event(rng, aabb, pos, dir, bitgrid, scale)) {
+				break;
+			}
+		}
+
+		vec4 col;
+		if (absorbed) {
+			col = vec4(accumulated_radiance, 1.0f);
+		} else {
+			vec4 env = scattered ? proc_envmap(dir, up_dir, sun_dir, sky_col) : proc_envmap_render(dir, up_dir, sun_dir, sky_col);
+			col.rgb() = accumulated_radiance + transmittance * env.rgb();
+			col.a = 1.0f;
+		}
+		frame_buffer[pixidx] = col;
 	}
-	frame_buffer[pixidx] = col;
 }
 
 __global__ void volume_render_kernel_step(
@@ -397,7 +613,17 @@ __global__ void volume_render_kernel_step(
 	float albedo,
 	float scattering,
 	vec4* __restrict__ frame_buffer,
-	bool force_finish_ray
+	bool force_finish_ray,
+	// Physics parameters
+	float sun_intensity,
+	int shadow_steps,
+	int ms_octaves,
+	float ms_attenuation,
+	bool enable_direct_light,
+	bool enable_beer_powder,
+	bool use_dual_lobe,
+	HydrometeorProps hydro_props,
+	bool enable_physics // master toggle
 ) {
 	uint32_t idx = threadIdx.x + blockDim.x * blockIdx.x;
 	if (idx >= n_pixels || idx >= pixel_counter_in[0]) {
@@ -414,7 +640,6 @@ __global__ void volume_render_kernel_step(
 	rng.advance(pixidx << 8);
 	const nanovdb::FloatGrid* grid = reinterpret_cast<const nanovdb::FloatGrid*>(nanovdb);
 	auto acc = grid->tree().getAccessor();
-	// ye olde delta tracker
 
 	vec4 local_output = network_outputs_in[idx];
 	float scale = distance_scale / global_majorant;
@@ -425,7 +650,24 @@ __global__ void volume_render_kernel_step(
 	}
 	float T = 1.f - payload.col.a;
 	float alpha = extinction_prob * T;
-	payload.col.rgb() += local_output.rgb() * alpha;
+
+	vec3 final_rgb = local_output.rgb();
+
+	if (enable_physics && enable_direct_light && density > 0.001f) {
+		// Add physics-based direct illumination on top of network output
+		vec3 sun_color = vec3{1.0f, 0.95f, 0.85f};
+		vec3 L_physics = compute_inscattered_radiance(
+			pos, dir, sun_dir, sun_color, sun_intensity,
+			density, global_majorant, hydro_props, use_dual_lobe,
+			enable_beer_powder, ms_octaves, ms_attenuation,
+			aabb, grid, world2index_offset, world2index_scale,
+			shadow_steps, sky_col, up_dir
+		);
+		// Blend: network provides learned ambient/indirect, physics adds direct lighting
+		final_rgb = final_rgb + L_physics * 0.5f;
+	}
+
+	payload.col.rgb() += final_rgb * alpha;
 	payload.col.a += alpha;
 	if (payload.col.a > 0.99f || !walk_to_next_event(rng, aabb, pos, dir, bitgrid, scale) || force_finish_ray) {
 		payload.col += (1.f - payload.col.a) * proc_envmap_render(dir, up_dir, sun_dir, sky_col);
@@ -499,6 +741,14 @@ void Testbed::render_volume(
 	CUDA_CHECK_THROW(cudaMemcpyAsync(&n, m_volume.hit_counter.data(), sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
 	CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
 
+	// Compute blended hydrometeor properties for rendering
+	HydrometeorProps render_hydro_props = blend_hydrometeor_props(m_volume.phase_fractions);
+	if (m_volume.albedo_override > 0.0f) render_hydro_props.albedo = m_volume.albedo_override;
+	if (m_volume.g_override != 0.0f) { render_hydro_props.g1 = m_volume.g_override; render_hydro_props.g2 = -m_volume.g_override * 0.35f; }
+
+	// When physics disabled, use original albedo for rendering
+	float render_albedo = m_volume.enable_physics ? std::min(render_hydro_props.albedo, 0.9999f) : std::min(0.95f, 0.995f);
+
 	if (m_render_ground_truth) {
 		linear_kernel(
 			volume_render_kernel_gt,
@@ -521,9 +771,18 @@ void Testbed::render_volume(
 			m_volume.world2index_offset,
 			m_volume.world2index_scale,
 			distance_scale,
-			std::min(m_volume.albedo, 0.995f),
-			m_volume.scattering,
-			render_buffer.frame_buffer
+			render_albedo,
+			render_hydro_props.g1,
+			render_buffer.frame_buffer,
+			m_volume.sun_intensity,
+			m_volume.shadow_steps,
+			m_volume.ms_octaves,
+			m_volume.ms_attenuation,
+			m_volume.enable_direct_light,
+			m_volume.enable_beer_powder,
+			m_volume.use_dual_lobe,
+			render_hydro_props,
+			m_volume.enable_physics
 		);
 		m_rng.advance(n_pixels * 256);
 	} else {
@@ -565,15 +824,23 @@ void Testbed::render_volume(
 				m_volume.world2index_offset,
 				m_volume.world2index_scale,
 				distance_scale,
-				std::min(m_volume.albedo, 0.995f),
-				m_volume.scattering,
+				render_albedo,
+				render_hydro_props.g1,
 				render_buffer.frame_buffer,
-				(iter >= max_iter - 1)
+				(iter >= max_iter - 1),
+				m_volume.sun_intensity,
+				m_volume.shadow_steps,
+				m_volume.ms_octaves,
+				m_volume.ms_attenuation,
+				m_volume.enable_direct_light,
+				m_volume.enable_beer_powder,
+				m_volume.use_dual_lobe,
+				render_hydro_props,
+				m_volume.enable_physics
 			);
 
 			m_rng.advance(n_pixels * 256);
 			if (((iter + 1) % 4) == 0) {
-				// periodically tell the cpu how many pixels are left
 				CUDA_CHECK_THROW(cudaMemcpyAsync(&n, m_volume.hit_counter.data() + dstbuf, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
 				CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
 			}
@@ -605,6 +872,37 @@ struct NanoVDBMetaData {
 	uint32_t version;                                 // 4B
 };
 static_assert(sizeof(NanoVDBMetaData) == 176, "nanovdb padding error");
+
+// Detect hydrometeor species from NanoVDB grid name
+// Matches common HRRR/WRF variable names and descriptive names
+static int detect_species_from_name(const char* name) {
+	// Convert to lowercase for matching
+	char lower[256] = {};
+	for (int i = 0; i < 255 && name[i]; i++) {
+		lower[i] = (name[i] >= 'A' && name[i] <= 'Z') ? (name[i] + 32) : name[i];
+	}
+	// Ice crystals: QICE, cloud_ice, ice, qi
+	if (strstr(lower, "ice") || strstr(lower, "qi")) return (int)EHydrometeorType::Ice;
+	// Snow: QSNOW, snow, qs
+	if (strstr(lower, "snow") || strstr(lower, "qs")) return (int)EHydrometeorType::Snow;
+	// Graupel: QGRAUP, graupel, hail, qg
+	if (strstr(lower, "graup") || strstr(lower, "hail") || strstr(lower, "qg")) return (int)EHydrometeorType::Graupel;
+	// Water: QCLOUD, cloud_water, water, lwc, qc, QRAIN, rain, qr
+	if (strstr(lower, "water") || strstr(lower, "qcloud") || strstr(lower, "lwc") ||
+	    strstr(lower, "qc") || strstr(lower, "rain") || strstr(lower, "qr")) return (int)EHydrometeorType::Water;
+	// Default: treat as water (most common single-grid case)
+	return (int)EHydrometeorType::Water;
+}
+
+static const char* species_name(int species_id) {
+	switch (species_id) {
+		case 0: return "Water";
+		case 1: return "Ice";
+		case 2: return "Snow";
+		case 3: return "Graupel";
+		default: return "Unknown";
+	}
+}
 
 void Testbed::load_volume(const fs::path& data_path) {
 	if (!data_path.exists()) {
@@ -639,6 +937,15 @@ void Testbed::load_volume(const fs::path& data_path) {
 				 << metadata.indexBBox[0][0] << "," << metadata.indexBBox[0][1] << "," << metadata.indexBBox[0][2] << "],max]["
 				 << metadata.indexBBox[1][0] << "," << metadata.indexBBox[1][1] << "," << metadata.indexBBox[1][2] << "]]";
 
+	// Auto-detect hydrometeor species from grid name and set initial fractions
+	int species_id = detect_species_from_name(name);
+	m_volume.detected_species_name = species_name(species_id);
+	for (int s = 0; s < 4; s++) m_volume.phase_fractions[s] = 0.0f;
+	m_volume.phase_fractions[species_id] = 1.0f;
+	m_volume.fractions_from_file = true;
+	tlog::info() << "Auto-detected species: " << m_volume.detected_species_name
+	             << " (adjust manually in UI for mixed-phase clouds)";
+
 	std::vector<char> cpugrid;
 	cpugrid.resize(metadata.gridSize);
 	f.read(cpugrid.data(), metadata.gridSize);
@@ -648,7 +955,6 @@ void Testbed::load_volume(const fs::path& data_path) {
 
 	float mn = 10000.0f, mx = -10000.0f;
 	bool hmm = grid->hasMinMax();
-	// grid->tree().extrema(mn,mx);
 	int xsize = std::max(1, metadata.indexBBox[1][0] - metadata.indexBBox[0][0]);
 	int ysize = std::max(1, metadata.indexBBox[1][1] - metadata.indexBBox[0][1]);
 	int zsize = std::max(1, metadata.indexBBox[1][2] - metadata.indexBBox[0][2]);
@@ -695,7 +1001,6 @@ void Testbed::load_volume(const fs::path& data_path) {
 	m_volume.bitgrid.enlarge(bitgrid.size());
 	m_volume.bitgrid.copy_from_host(bitgrid);
 	tlog::info() << "nanovdb extrema: " << mn << " " << mx << " (" << hmm << ")";
-	;
 	m_volume.global_majorant = mx;
 }
 
