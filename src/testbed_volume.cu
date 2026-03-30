@@ -296,12 +296,25 @@ __global__ void volume_generate_training_data_kernel(
 		}
 		vec4 envcolor = proc_envmap(dir, up_dir, sun_dir, sky_col) * throughput;
 		uint32_t oidx = idx * MAX_TRAIN_VERTICES;
-		for (uint32_t i = prev_numout; i < numout; ++i) {
-			pos_out[oidx + i] = outpos[i];
-			if (enable_physics) {
-				vec3 combined_rgb = envcolor.rgb() + outradiance[i];
-				target_out[oidx + i] = vec4(combined_rgb, outdensity[i]);
-			} else {
+		if (enable_physics) {
+			// Each vertex gets LOCAL inscattered radiance + exit color as its target.
+			// This is compatible with the step kernel's alpha compositing, which treats
+			// the network output as the local source radiance at each position.
+			// (Backward cumulative would double-count in alpha compositing.)
+			for (uint32_t i = prev_numout; i < numout; ++i) {
+				vec3 local_rgb = envcolor.rgb() + outradiance[i];
+				// Reinhard tone-map to keep training targets in [0,1) for network stability
+				vec3 mapped = vec3{
+					local_rgb.x / (1.0f + local_rgb.x),
+					local_rgb.y / (1.0f + local_rgb.y),
+					local_rgb.z / (1.0f + local_rgb.z)
+				};
+				pos_out[oidx + i] = outpos[i];
+				target_out[oidx + i] = vec4(mapped, outdensity[i]);
+			}
+		} else {
+			for (uint32_t i = prev_numout; i < numout; ++i) {
+				pos_out[oidx + i] = outpos[i];
 				target_out[oidx + i] = envcolor;
 				target_out[oidx + i].w = outdensity[i];
 			}
@@ -539,52 +552,49 @@ __global__ void volume_render_kernel_gt(
 		}
 		frame_buffer[pixidx] = col;
 	} else {
-		// ===== PHYSICS-BASED RENDERING =====
+		// ===== PHYSICS-BASED RENDERING (single-pass ray march) =====
+		// Uses the same alpha-compositing model as the step kernel so GT and
+		// network-rendered images compute the same integral:
+		//   pixel = Σ (env + L_inscatter_i) * alpha_i + (1 - total_alpha) * env
+		// Direction is FIXED (no scattering bounces) — matches step kernel behavior.
 		vec3 sun_color = vec3{1.0f, 0.95f, 0.85f};
-		vec3 accumulated_radiance = vec3(0.0f);
-		float transmittance = 1.0f;
+		vec4 env = proc_envmap_render(dir, up_dir, sun_dir, sky_col);
+		vec4 accum = vec4(0.0f); // accumulated RGBA
 
 		for (int iter = 0; iter < 128; ++iter) {
 			vec3 nanovdbpos = pos * world2index_scale + world2index_offset;
 			float density =
 				acc.getValue({int(nanovdbpos.x + random_val(rng)), int(nanovdbpos.y + random_val(rng)), int(nanovdbpos.z + random_val(rng))});
+
 			float extinction_prob = density / global_majorant;
-			float scatter_prob = extinction_prob * hydro_props.albedo;
-			float zeta2 = random_val(rng);
-			if (zeta2 < scatter_prob) {
-				// Compute direct illumination before changing direction
-				if (enable_direct_light && density > 0.001f) {
-					vec3 L_inscatter = compute_inscattered_radiance(
-						pos, dir, sun_dir, sun_color, sun_intensity,
-						density, global_majorant, hydro_props, use_dual_lobe,
-						enable_beer_powder, ms_octaves, ms_attenuation,
-						aabb, grid, world2index_offset, world2index_scale,
-						shadow_steps, sky_col, up_dir
-					);
-					accumulated_radiance += transmittance * L_inscatter;
-				}
-				transmittance *= hydro_props.albedo;
+			if (extinction_prob > 1.0f) extinction_prob = 1.0f;
 
-				// HG phase function sampling
-				dir = sample_dual_lobe_hg(dir, hydro_props, rng);
-				scattered = true;
-			} else if (zeta2 < extinction_prob) {
-				absorbed = true;
-				break;
+			float T = 1.0f - accum.a;
+			float alpha = extinction_prob * T;
+
+			// Local source = environment + inscattered radiance at this position
+			vec3 local_rgb = env.rgb();
+			if (enable_direct_light && density > 0.001f) {
+				local_rgb = local_rgb + compute_inscattered_radiance(
+					pos, dir, sun_dir, sun_color, sun_intensity,
+					density, global_majorant, hydro_props, use_dual_lobe,
+					enable_beer_powder, ms_octaves, ms_attenuation,
+					aabb, grid, world2index_offset, world2index_scale,
+					shadow_steps, sky_col, up_dir
+				);
 			}
-			if (!walk_to_next_event(rng, aabb, pos, dir, bitgrid, scale)) {
-				break;
-			}
+
+			accum.rgb() += local_rgb * alpha;
+			accum.a += alpha;
+
+			if (accum.a > 0.99f) break;
+			if (!walk_to_next_event(rng, aabb, pos, dir, bitgrid, scale)) break;
 		}
 
+		// Remaining transmittance → environment
 		vec4 col;
-		if (absorbed) {
-			col = vec4(accumulated_radiance, 1.0f);
-		} else {
-			vec4 env = scattered ? proc_envmap(dir, up_dir, sun_dir, sky_col) : proc_envmap_render(dir, up_dir, sun_dir, sky_col);
-			col.rgb() = accumulated_radiance + transmittance * env.rgb();
-			col.a = 1.0f;
-		}
+		col.rgb() = accum.rgb() + (1.0f - accum.a) * env.rgb();
+		col.a = 1.0f;
 		frame_buffer[pixidx] = col;
 	}
 }
@@ -653,18 +663,21 @@ __global__ void volume_render_kernel_step(
 
 	vec3 final_rgb = local_output.rgb();
 
-	if (enable_physics && enable_direct_light && density > 0.001f) {
-		// Add physics-based direct illumination on top of network output
-		vec3 sun_color = vec3{1.0f, 0.95f, 0.85f};
-		vec3 L_physics = compute_inscattered_radiance(
-			pos, dir, sun_dir, sun_color, sun_intensity,
-			density, global_majorant, hydro_props, use_dual_lobe,
-			enable_beer_powder, ms_octaves, ms_attenuation,
-			aabb, grid, world2index_offset, world2index_scale,
-			shadow_steps, sky_col, up_dir
-		);
-		// Blend: network provides learned ambient/indirect, physics adds direct lighting
-		final_rgb = final_rgb + L_physics * 0.5f;
+	if (enable_physics) {
+		// Network was trained on tone-mapped radiance (Reinhard: L/(1+L)).
+		// Inverse tone-map to recover linear HDR radiance for compositing.
+		// Clamp input to [0, 0.995] to prevent fireflies from network overshooting 1.0.
+		// Inverse Reinhard: L = x / (1 - x). At x=0.995, L=199 which is a safe upper bound.
+		final_rgb = vec3{
+			fmaxf(fminf(final_rgb.x, 0.995f), 0.0f),
+			fmaxf(fminf(final_rgb.y, 0.995f), 0.0f),
+			fmaxf(fminf(final_rgb.z, 0.995f), 0.0f)
+		};
+		final_rgb = vec3{
+			final_rgb.x / (1.0f - final_rgb.x),
+			final_rgb.y / (1.0f - final_rgb.y),
+			final_rgb.z / (1.0f - final_rgb.z)
+		};
 	}
 
 	payload.col.rgb() += final_rgb * alpha;
