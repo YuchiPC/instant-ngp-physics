@@ -251,68 +251,96 @@ __global__ void volume_generate_training_data_kernel(
 		float t = max(box_intersection.x, 0.0f);
 		pos = pos + (t + 1e-6f) * dir;
 		float throughput = 1.f;
-		for (int iter = 0; iter < 128; ++iter) {
-			if (!walk_to_next_event(rng, aabb, pos, dir, bitgrid, scale)) {
-				break;
-			}
-			vec3 nanovdbpos = pos * world2index_scale + world2index_offset;
-			float density = acc.getValue(
-				{int(nanovdbpos.x + random_val(rng)), int(nanovdbpos.y + random_val(rng)), int(nanovdbpos.z + random_val(rng))}
-			);
 
-			if (numout < MAX_TRAIN_VERTICES) {
-				outdensity[numout] = density;
-				outpos[numout] = pos;
-				if (enable_physics && enable_direct_light && density > 0.001f) {
-					outradiance[numout] = compute_inscattered_radiance(
-						pos, dir, sun_dir, sun_color, sun_intensity,
-						density, global_majorant, hydro_props, use_dual_lobe,
-						enable_beer_powder, ms_octaves, ms_attenuation,
-						aabb, grid, world2index_offset, world2index_scale,
-						shadow_steps, sky_col, up_dir
-					);
-				} else {
-					outradiance[numout] = vec3(0.0f);
-				}
-				numout++;
-			}
-
-			float extinction_prob = density / global_majorant;
-			float scatter_prob = extinction_prob * effective_albedo;
-			float zeta2 = random_val(rng);
-			if (zeta2 >= extinction_prob) {
-				continue; // null collision
-			}
-			if (zeta2 < scatter_prob) {
-				if (enable_physics) {
-					dir = sample_dual_lobe_hg(dir, hydro_props, rng);
-				} else {
-					dir = normalize(random_dir(rng)); // original isotropic
-				}
-			} else {
-				throughput = 0.f; // absorb
-				break;
-			}
-		}
-		vec4 envcolor = proc_envmap(dir, up_dir, sun_dir, sky_col) * throughput;
-		uint32_t oidx = idx * MAX_TRAIN_VERTICES;
 		if (enable_physics) {
-			// Each vertex gets LOCAL inscattered radiance + exit color as its target.
-			// This is compatible with the step kernel's alpha compositing, which treats
-			// the network output as the local source radiance at each position.
-			// (Backward cumulative would double-count in alpha compositing.)
+			// Physics training: fixed-direction ray march matching the GT kernel.
+			// Direction does NOT change (no scattering bounces) — same model as
+			// the GT kernel and step kernel, so training targets are consistent.
+			// Each vertex target = env(view_dir) + inscattered_radiance(pos).
+			vec4 env = proc_envmap(dir, up_dir, sun_dir, sky_col);
+			for (int iter = 0; iter < 128; ++iter) {
+				if (!walk_to_next_event(rng, aabb, pos, dir, bitgrid, scale)) {
+					break;
+				}
+				vec3 nanovdbpos = pos * world2index_scale + world2index_offset;
+				float density = acc.getValue(
+					{int(nanovdbpos.x + random_val(rng)), int(nanovdbpos.y + random_val(rng)), int(nanovdbpos.z + random_val(rng))}
+				);
+
+				if (numout < MAX_TRAIN_VERTICES) {
+					outdensity[numout] = density;
+					outpos[numout] = pos;
+					if (enable_direct_light && density > 0.001f) {
+						outradiance[numout] = compute_inscattered_radiance(
+							pos, dir, sun_dir, sun_color, sun_intensity,
+							density, global_majorant, hydro_props, use_dual_lobe,
+							enable_beer_powder, ms_octaves, ms_attenuation,
+							aabb, grid, world2index_offset, world2index_scale,
+							shadow_steps, sky_col, up_dir
+						);
+					} else {
+						outradiance[numout] = vec3(0.0f);
+					}
+					numout++;
+				}
+
+				// Delta-tracking: accept/reject based on density
+				float extinction_prob = density / global_majorant;
+				float scatter_prob = extinction_prob * effective_albedo;
+				float zeta2 = random_val(rng);
+				if (zeta2 >= extinction_prob) {
+					continue; // null collision
+				}
+				if (zeta2 >= scatter_prob) {
+					throughput = 0.f; // absorb
+					break;
+				}
+				// Scatter event: do NOT change dir — matches fixed-direction GT model
+			}
+
+			uint32_t oidx = idx * MAX_TRAIN_VERTICES;
 			for (uint32_t i = prev_numout; i < numout; ++i) {
-				vec3 local_rgb = envcolor.rgb() + outradiance[i];
-				// Reinhard tone-map to keep training targets in [0,1) for network stability
-				vec3 mapped = vec3{
-					local_rgb.x / (1.0f + local_rgb.x),
-					local_rgb.y / (1.0f + local_rgb.y),
-					local_rgb.z / (1.0f + local_rgb.z)
-				};
+				// Target = env + inscattered, in linear space (no tone mapping).
+				// env is from the ORIGINAL view direction (dir never changed),
+				// matching the GT kernel exactly. No throughput modulation here —
+				// opacity weighting is handled by alpha compositing during rendering.
+				vec3 local_rgb = env.rgb() + outradiance[i];
 				pos_out[oidx + i] = outpos[i];
-				target_out[oidx + i] = vec4(mapped, outdensity[i]);
+				target_out[oidx + i] = vec4(local_rgb, outdensity[i]);
 			}
 		} else {
+			// Original path: Monte Carlo with isotropic scattering
+			for (int iter = 0; iter < 128; ++iter) {
+				if (!walk_to_next_event(rng, aabb, pos, dir, bitgrid, scale)) {
+					break;
+				}
+				vec3 nanovdbpos = pos * world2index_scale + world2index_offset;
+				float density = acc.getValue(
+					{int(nanovdbpos.x + random_val(rng)), int(nanovdbpos.y + random_val(rng)), int(nanovdbpos.z + random_val(rng))}
+				);
+
+				if (numout < MAX_TRAIN_VERTICES) {
+					outdensity[numout] = density;
+					outpos[numout] = pos;
+					outradiance[numout] = vec3(0.0f);
+					numout++;
+				}
+
+				float extinction_prob = density / global_majorant;
+				float scatter_prob = extinction_prob * effective_albedo;
+				float zeta2 = random_val(rng);
+				if (zeta2 >= extinction_prob) {
+					continue; // null collision
+				}
+				if (zeta2 < scatter_prob) {
+					dir = normalize(random_dir(rng)); // isotropic scattering
+				} else {
+					throughput = 0.f; // absorb
+					break;
+				}
+			}
+			vec4 envcolor = proc_envmap(dir, up_dir, sun_dir, sky_col) * throughput;
+			uint32_t oidx = idx * MAX_TRAIN_VERTICES;
 			for (uint32_t i = prev_numout; i < numout; ++i) {
 				pos_out[oidx + i] = outpos[i];
 				target_out[oidx + i] = envcolor;
@@ -343,8 +371,14 @@ void Testbed::train_volume(size_t target_batch_size, bool get_loss_scalar, cudaS
 	if (m_volume.albedo_override > 0.0f) hydro_props.albedo = m_volume.albedo_override;
 	if (m_volume.g_override != 0.0f) { hydro_props.g1 = m_volume.g_override; hydro_props.g2 = -m_volume.g_override * 0.35f; }
 
-	// When physics disabled, use original defaults for training
-	float train_albedo = m_volume.enable_physics ? hydro_props.albedo : 0.95f;
+	// Always train with original (non-physics) MC algorithm.
+	// The position-only network (3 inputs, no direction) cannot represent the
+	// strongly view-dependent HG phase function (~300x variation), so baking
+	// inscattered radiance into training targets causes the network to learn
+	// the direction-averaged value — which doesn't match the GT for any specific
+	// camera direction. Instead, we train the network on the smooth radiance
+	// field it's good at, and add physics at render time in the step kernel.
+	float train_albedo = 0.95f;
 
 	linear_kernel(
 		volume_generate_training_data_kernel,
@@ -374,7 +408,7 @@ void Testbed::train_volume(size_t target_batch_size, bool get_loss_scalar, cudaS
 		m_volume.enable_beer_powder,
 		m_volume.use_dual_lobe,
 		hydro_props,
-		m_volume.enable_physics
+		false  // enable_physics: always false for training (physics added at render time)
 	);
 	m_rng.advance(n_elements * 256);
 
@@ -663,21 +697,23 @@ __global__ void volume_render_kernel_step(
 
 	vec3 final_rgb = local_output.rgb();
 
-	if (enable_physics) {
-		// Network was trained on tone-mapped radiance (Reinhard: L/(1+L)).
-		// Inverse tone-map to recover linear HDR radiance for compositing.
-		// Clamp input to [0, 0.995] to prevent fireflies from network overshooting 1.0.
-		// Inverse Reinhard: L = x / (1 - x). At x=0.995, L=199 which is a safe upper bound.
-		final_rgb = vec3{
-			fmaxf(fminf(final_rgb.x, 0.995f), 0.0f),
-			fmaxf(fminf(final_rgb.y, 0.995f), 0.0f),
-			fmaxf(fminf(final_rgb.z, 0.995f), 0.0f)
-		};
-		final_rgb = vec3{
-			final_rgb.x / (1.0f - final_rgb.x),
-			final_rgb.y / (1.0f - final_rgb.y),
-			final_rgb.z / (1.0f - final_rgb.z)
-		};
+	if (enable_physics && enable_direct_light) {
+		// Network was trained WITHOUT physics (original MC algorithm).
+		// Add inscattered radiance at render time using the NanoVDB grid directly,
+		// with the actual camera direction — this gives the correct view-dependent
+		// phase function value, which the position-only network cannot learn.
+		vec3 nanovdbpos = pos * world2index_scale + world2index_offset;
+		float grid_density = acc.getValue({(int)nanovdbpos.x, (int)nanovdbpos.y, (int)nanovdbpos.z});
+		if (grid_density > 0.001f) {
+			vec3 sun_color = vec3{1.0f, 0.95f, 0.85f};
+			final_rgb += compute_inscattered_radiance(
+				pos, dir, sun_dir, sun_color, sun_intensity,
+				grid_density, global_majorant, hydro_props, use_dual_lobe,
+				enable_beer_powder, ms_octaves, ms_attenuation,
+				aabb, grid, world2index_offset, world2index_scale,
+				shadow_steps, sky_col, up_dir
+			);
+		}
 	}
 
 	payload.col.rgb() += final_rgb * alpha;
