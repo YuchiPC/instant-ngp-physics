@@ -1269,6 +1269,28 @@ void Testbed::imgui() {
 			accum_reset |= ImGui::Checkbox("Enable Cloud Physics", &m_volume.enable_physics);
 			if (!m_volume.enable_physics) {
 				ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.0f, 1.0f), "Physics OFF: original rendering");
+				// Auto-disable physics-in-the-loop when physics is turned off
+				// (network output semantics would be wrong otherwise)
+				if (m_volume.physics_in_the_loop) {
+					m_volume.physics_in_the_loop = false;
+					reload_network_from_file();
+				}
+			}
+
+			if (m_volume.enable_physics) {
+				bool old_pitl = m_volume.physics_in_the_loop;
+				accum_reset |= ImGui::Checkbox("Physics-in-the-Loop", &m_volume.physics_in_the_loop);
+				if (m_volume.physics_in_the_loop != old_pitl) {
+					// Network output semantics changed (material params ↔ radiance).
+					// Must reset network weights — old weights predict the wrong thing.
+					reload_network_from_file();
+				}
+				if (m_volume.physics_in_the_loop) {
+					ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f),
+						"Network predicts materials; renderer evaluates RTE");
+					ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f),
+						"Relighting: change sun dir/intensity at any time");
+				}
 			}
 
 			accum_reset |= ImGui::SliderFloat(

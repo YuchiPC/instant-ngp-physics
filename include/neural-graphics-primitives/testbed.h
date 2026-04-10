@@ -980,6 +980,11 @@ public:
 		// --- Master physics toggle (false = original rendering for A/B comparison) ---
 		bool  enable_physics = true;
 
+		// --- Physics-in-the-loop: network predicts material params (albedo, g, w_g1),
+		//     renderer evaluates RTE at render time. Enables relighting & material editing.
+		//     When false (legacy): network predicts pre-baked radiance (RGB). ---
+		bool  physics_in_the_loop = false;
+
 		// --- Hydrometeor mix fractions [water, ice, snow, graupel] ---
 		// Auto-set from NanoVDB grid names on load. Must sum to 1.0.
 		float phase_fractions[4] = {1.0f, 0.0f, 0.0f, 0.0f};
@@ -1021,6 +1026,9 @@ public:
 		struct Training {
 			GPUMemory<vec3> positions = {};
 			GPUMemory<vec4> targets = {};
+			// Physics-in-the-loop: per-vertex auxiliary data for differentiable physics
+			// (T_sun, cos_theta, gt_density, padding)
+			GPUMemory<vec4> physics_aux = {};
 		} training = {};
 
 		// tracing state
