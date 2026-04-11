@@ -246,7 +246,6 @@ __global__ void physics_forward_backward_kernel(
 	float sun_intensity,
 	vec3 sky_col,
 	float ambient_factor,
-	HydrometeorProps gt_props, // ground truth material properties
 	float radiance_loss_weight,
 	float density_loss_weight
 ) {
@@ -397,6 +396,7 @@ __global__ void volume_generate_training_data_kernel(
 	vec3 outpos[MAX_TRAIN_VERTICES];
 	float outdensity[MAX_TRAIN_VERTICES];
 	vec3 outradiance[MAX_TRAIN_VERTICES];
+	float outcos[MAX_TRAIN_VERTICES]; // PITL: cos(θ) = dot(dir, sun_dir) at each vertex
 	float scale = distance_scale / global_majorant;
 	const nanovdb::FloatGrid* grid = reinterpret_cast<const nanovdb::FloatGrid*>(nanovdb);
 	auto acc = grid->tree().getAccessor();
@@ -425,6 +425,7 @@ __global__ void volume_generate_training_data_kernel(
 			if (numout < MAX_TRAIN_VERTICES) {
 				outdensity[numout] = density;
 				outpos[numout] = pos;
+				outcos[numout] = dot(dir, sun_dir); // capture viewing angle BEFORE scattering changes dir
 				if (physics_in_the_loop) {
 					// Physics-in-the-loop: skip radiance computation during training.
 					// Training targets are material params, not radiance.
@@ -474,19 +475,18 @@ __global__ void volume_generate_training_data_kernel(
 			for (uint32_t i = prev_numout; i < numout; ++i) {
 				pos_out[oidx + i] = outpos[i];
 
-				// Compute GT radiance using simplified single-scattering model
-				// (same model as the differentiable physics kernel, so loss → 0
-				// when network predictions → GT material params)
-				float cos_th = dot(dir, sun_dir);
+				// Use per-vertex cos_theta captured during the inner loop (before
+				// scattering could redirect dir). This is the correct viewing angle
+				// at each sample position.
+				float cos_th = outcos[i];
 				float T_s = 0.0f;
-				float gt_phase = 0.0f;
 				vec3 gt_rad = vec3(0.0f);
 
 				if (outdensity[i] > 0.001f) {
 					T_s = march_to_sun(outpos[i], sun_dir, aabb, grid,
 					                   world2index_offset, world2index_scale,
 					                   global_majorant, shadow_steps);
-					gt_phase = dual_lobe_hg(cos_th, hydro_props.g1, hydro_props.g2, hydro_props.w_g1);
+					float gt_phase = dual_lobe_hg(cos_th, hydro_props.g1, hydro_props.g2, hydro_props.w_g1);
 					gt_rad = vec3{
 						hydro_props.albedo * gt_phase * T_s * sun_color.x * sun_intensity + sky_col.x * isotropic_phase * 0.15f,
 						hydro_props.albedo * gt_phase * T_s * sun_color.y * sun_intensity + sky_col.y * isotropic_phase * 0.15f,
@@ -626,7 +626,6 @@ void Testbed::train_volume(size_t target_batch_size, bool get_loss_scalar, cudaS
 			m_volume.sun_intensity,
 			sky_col,
 			0.15f, // ambient_factor (matches GT computation in training data kernel)
-			hydro_props,
 			1.0f,  // radiance_loss_weight
 			0.1f   // density_loss_weight
 		);
