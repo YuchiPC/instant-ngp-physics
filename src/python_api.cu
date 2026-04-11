@@ -651,6 +651,9 @@ PYBIND11_MODULE(pyngp, m) {
 		.def_readwrite("screen_center", &Testbed::m_screen_center)
 		.def_readwrite("training_batch_size", &Testbed::m_training_batch_size)
 		.def("set_nerf_camera_matrix", &Testbed::set_nerf_camera_matrix)
+		.def("set_camera_to_goes_east_view", &Testbed::set_camera_to_goes_east_view,
+			"Set orthographic camera to match GOES-East satellite viewing angle for given ROI center.",
+			py::arg("lat_deg"), py::arg("lon_deg"))
 		.def("set_camera_to_training_view", &Testbed::set_camera_to_training_view)
 		.def("first_training_view", &Testbed::first_training_view)
 		.def("last_training_view", &Testbed::last_training_view)

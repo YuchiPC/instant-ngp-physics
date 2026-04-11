@@ -439,6 +439,80 @@ void Testbed::translate_camera(const vec3& rel, const mat3& rot, bool allow_up_d
 
 void Testbed::set_nerf_camera_matrix(const mat4x3& cam) { m_camera = m_nerf.training.dataset.nerf_matrix_to_ngp(cam); }
 
+void Testbed::set_camera_to_goes_east_view(float lat_deg, float lon_deg) {
+	// GOES-East (GOES-16) geostationary position
+	constexpr float GOES_LAT = 0.0f;
+	constexpr float GOES_LON = -75.2f;  // degrees
+	constexpr float GOES_ALT = 35786.0f; // km
+	constexpr float R_EARTH  = 6371.0f;  // km
+	constexpr float DEG2RAD  = 3.14159265358979f / 180.0f;
+
+	// Geodetic to ECEF (spherical Earth)
+	auto to_ecef = [&](float lat_d, float lon_d, float alt_km) -> vec3 {
+		float la = lat_d * DEG2RAD, lo = lon_d * DEG2RAD;
+		float r = R_EARTH + alt_km;
+		return {r * cosf(la) * cosf(lo), r * cosf(la) * sinf(lo), r * sinf(la)};
+	};
+
+	vec3 sat_ecef = to_ecef(GOES_LAT, GOES_LON, GOES_ALT);
+	vec3 roi_ecef = to_ecef(lat_deg, lon_deg, 0.0f);
+	vec3 d_ecef = sat_ecef - roi_ecef; // ground-to-satellite in ECEF
+
+	// ECEF to ENU rotation at (lat, lon)
+	float la = lat_deg * DEG2RAD, lo = lon_deg * DEG2RAD;
+	float sl = sinf(la), cl = cosf(la), so = sinf(lo), co = cosf(lo);
+
+	vec3 enu_e = {-so,      co,       0.0f};
+	vec3 enu_n = {-sl * co, -sl * so, cl};
+	vec3 enu_u = { cl * co,  cl * so, sl};
+
+	vec3 to_sat_enu = {
+		dot(enu_e, d_ecef),
+		dot(enu_n, d_ecef),
+		dot(enu_u, d_ecef),
+	};
+
+	float sat_dist = length(to_sat_enu);
+	vec3 view_dir_enu = -to_sat_enu / sat_dist; // satellite-to-ground in ENU
+
+	// Store computed angles for display
+	m_volume.sat_zenith_deg  = acosf(fminf(-view_dir_enu.z, 1.0f)) / DEG2RAD;
+	m_volume.sat_azimuth_deg = atan2f(view_dir_enu.x, view_dir_enu.y) / DEG2RAD;
+
+	// Build orthonormal camera basis in ENU (= volume XYZ: East→+X, North→+Y, Up→+Z)
+	vec3 forward = view_dir_enu;
+	vec3 up_hint = {0.0f, 0.0f, 1.0f};
+	vec3 right_raw = cross(up_hint, forward);
+	// Degenerate when looking straight down (sub-satellite point): use North as fallback
+	if (length(right_raw) < 1e-6f) {
+		up_hint = {0.0f, 1.0f, 0.0f};
+		right_raw = cross(up_hint, forward);
+	}
+	vec3 right = normalize(right_raw);
+	vec3 up = normalize(cross(forward, right));
+
+	// Volume center and extent in NGP space
+	vec3 center = (m_render_aabb.min + m_render_aabb.max) * 0.5f;
+	vec3 extent = m_render_aabb.max - m_render_aabb.min;
+	float diag = length(extent);
+
+	// Place camera behind the volume along view direction
+	vec3 pos = center - forward * diag;
+
+	// Set camera matrix: columns [right | up | forward | position]
+	m_camera[0] = right;
+	m_camera[1] = up;
+	m_camera[2] = forward;
+	m_camera[3] = pos;
+
+	// Switch to orthographic lens
+	m_render_with_lens_distortion = true;
+	m_render_lens.mode = ELensMode::Orthographic;
+
+	m_smoothed_camera = m_camera;
+	reset_accumulation(true);
+}
+
 vec3 Testbed::look_at() const { return view_pos() + view_dir() * m_scale; }
 
 void Testbed::set_look_at(const vec3& pos) { m_camera[3] += pos - look_at(); }
@@ -1333,6 +1407,37 @@ void Testbed::imgui() {
 					accum_reset |= ImGui::SliderFloat("MS attenuation",      &m_volume.ms_attenuation, 0.1f, 1.f);
 					accum_reset |= ImGui::Checkbox("Beer-Powder edges",      &m_volume.enable_beer_powder);
 					ImGui::TreePop();
+				}
+			}
+
+			ImGui::TreePop();
+		}
+
+		if (m_testbed_mode == ETestbedMode::Volume && ImGui::TreeNode("Satellite View (GOES-East)")) {
+			ImGui::Text("Match camera to GOES-East viewing angle");
+			ImGui::Separator();
+
+			accum_reset |= ImGui::InputFloat("Latitude (deg N)", &m_volume.sat_roi_lat, 0.1f, 1.0f, "%.4f");
+			accum_reset |= ImGui::InputFloat("Longitude (deg E)", &m_volume.sat_roi_lon, 0.1f, 1.0f, "%.4f");
+
+			static bool sat_camera_set = false;
+			if (ImGui::Button("Set GOES-East Camera")) {
+				set_camera_to_goes_east_view(m_volume.sat_roi_lat, m_volume.sat_roi_lon);
+				sat_camera_set = true;
+				accum_reset = true;
+			}
+
+			if (sat_camera_set) {
+				float elevation = 90.0f - m_volume.sat_zenith_deg;
+				ImGui::Text("Zenith: %.1f deg   Elevation: %.1f deg",
+					m_volume.sat_zenith_deg, elevation);
+				ImGui::Text("Azimuth: %.1f deg from N", m_volume.sat_azimuth_deg);
+				if (elevation < 10.0f) {
+					ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+						"Warning: low satellite elevation — location may be outside GOES-East coverage");
+				} else {
+					float parallax_15km = 15.0f * tanf(m_volume.sat_zenith_deg * 3.14159f / 180.0f);
+					ImGui::Text("Parallax at 15km cloud: %.1f km", parallax_15km);
 				}
 			}
 

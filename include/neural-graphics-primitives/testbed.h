@@ -446,6 +446,7 @@ public:
 	void mouse_wheel();
 	void load_file(const fs::path& path);
 	void set_nerf_camera_matrix(const mat4x3& cam);
+	void set_camera_to_goes_east_view(float lat_deg, float lon_deg);
 	vec3 look_at() const;
 	void set_look_at(const vec3& pos);
 	float scale() const { return m_scale; }
@@ -1016,6 +1017,12 @@ public:
 
 		// --- Species auto-detection (from NanoVDB grid name) ---
 		std::string detected_species_name; // for display in UI
+
+		// --- Satellite view matching (GOES-East) ---
+		float sat_roi_lat = 40.35f;       // ROI center latitude (degrees)
+		float sat_roi_lon = -74.65f;      // ROI center longitude (degrees)
+		float sat_zenith_deg = 0.0f;      // computed: viewing zenith angle
+		float sat_azimuth_deg = 0.0f;     // computed: viewing azimuth from N
 
 		GPUMemory<char> nanovdb_grid;
 		GPUMemory<uint8_t> bitgrid;
