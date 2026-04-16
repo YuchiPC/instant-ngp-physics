@@ -65,6 +65,8 @@
 #undef max
 #undef near
 #undef far
+#undef None
+#undef Success
 
 
 using namespace std::literals::chrono_literals;
@@ -506,6 +508,30 @@ void Testbed::set_camera_to_goes_east_view(float lat_deg, float lon_deg) {
 	m_camera[3] = pos;
 
 	// Switch to orthographic lens
+	m_render_with_lens_distortion = true;
+	m_render_lens.mode = ELensMode::Orthographic;
+
+	m_smoothed_camera = m_camera;
+	reset_accumulation(true);
+}
+
+void Testbed::set_camera_to_top_down_view() {
+	vec3 center = (m_render_aabb.min + m_render_aabb.max) * 0.5f;
+	vec3 extent = m_render_aabb.max - m_render_aabb.min;
+	float diag = length(extent);
+
+	vec3 forward = {0.0f, 0.0f, -1.0f};
+	vec3 up_hint = {0.0f, 1.0f, 0.0f};
+	vec3 right = normalize(cross(up_hint, forward));
+	vec3 up = normalize(cross(forward, right));
+
+	vec3 pos = center - forward * diag;
+
+	m_camera[0] = right;
+	m_camera[1] = up;
+	m_camera[2] = forward;
+	m_camera[3] = pos;
+
 	m_render_with_lens_distortion = true;
 	m_render_lens.mode = ELensMode::Orthographic;
 
@@ -1439,6 +1465,18 @@ void Testbed::imgui() {
 					float parallax_15km = 15.0f * tanf(m_volume.sat_zenith_deg * 3.14159f / 180.0f);
 					ImGui::Text("Parallax at 15km cloud: %.1f km", parallax_15km);
 				}
+			}
+
+			ImGui::TreePop();
+		}
+
+		if (m_testbed_mode == ETestbedMode::Volume && ImGui::TreeNode("Top-Down View")) {
+			ImGui::Text("Orthographic nadir (straight-down) camera");
+			ImGui::Separator();
+
+			if (ImGui::Button("Set Top-Down Camera")) {
+				set_camera_to_top_down_view();
+				accum_reset = true;
 			}
 
 			ImGui::TreePop();
@@ -4020,7 +4058,7 @@ void Testbed::init_vr() {
 
 		m_hmd = std::make_unique<OpenXRHMD>(xDisplay, visualInfo->visualid, glxFBConfig, glXGetCurrentDrawable(), glxContext);
 #	elif defined(XR_USE_PLATFORM_WAYLAND)
-		m_hmd = std::make_unique<OpenXRHMD>(glfwGetWaylandDisplay());
+		throw std::runtime_error{"VR is not supported in this WSL Wayland build."};
 #	endif
 
 		// Enable aggressive optimizations to make the VR experience smooth.
