@@ -75,6 +75,13 @@ int main_func(const std::vector<std::string>& arguments) {
 		{"no-train"},
 	};
 
+	Flag physics_flag{
+		parser,
+		"PHYSICS",
+		"Enables physics-in-the-loop volume training.",
+		{"physics"},
+	};
+
 	ValueFlag<string> scene_flag{
 		parser,
 		"SCENE",
@@ -165,6 +172,13 @@ int main_func(const std::vector<std::string>& arguments) {
 	}
 
 	testbed.m_train = !no_train_flag;
+
+	if (physics_flag && testbed.m_testbed_mode == ngp::ETestbedMode::Volume) {
+		testbed.m_volume.enable_physics = true;
+		testbed.m_volume.physics_in_the_loop = true;
+		testbed.reload_network_from_file();
+		tlog::info() << "Physics-in-the-loop enabled";
+	}
 
 #ifdef NGP_GUI
 	bool gui = !no_gui_flag;

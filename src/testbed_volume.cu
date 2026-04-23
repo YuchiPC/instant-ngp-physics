@@ -206,10 +206,11 @@ static constexpr uint32_t MAX_TRAIN_VERTICES =
 __device__ float henyey_greenstein_grad_g(float cos_theta, float g) {
 	float g2 = g * g;
 	float D = 1.0f + g2 - 2.0f * g * cos_theta;
-	float D_safe = fmaxf(D, 1e-8f);
-	float D52 = D_safe * D_safe * sqrtf(D_safe); // D^(5/2)
+	float D_safe = fmaxf(D, 1e-4f);
+	float D52 = D_safe * D_safe * sqrtf(D_safe);
 	float num = g * g2 + g2 * cos_theta - 5.0f * g + 3.0f * cos_theta;
-	return (1.0f / (4.0f * PI())) * num / D52;
+	float result = (1.0f / (4.0f * PI())) * num / D52;
+	return fminf(fmaxf(result, -10.0f), 10.0f);
 }
 
 // ============================================================================
@@ -231,28 +232,77 @@ __device__ float henyey_greenstein_grad_g(float cos_theta, float g) {
 // The GT radiance uses the same simplified physics model, ensuring the loss
 // can reach zero when predictions match ground truth.
 // ============================================================================
+
+// Huber loss kernel for cloud physics mode (standard Reinhard targets).
+// Replaces built-in L2 with Huber for better convergence near the optimum.
+template <typename T>
+__global__ void cloud_physics_huber_kernel(
+	uint32_t n_elements,
+	uint32_t padded_output_width,
+	uint32_t n_output_dims,
+	const T* __restrict__ network_output,
+	const float* __restrict__ target,
+	T* __restrict__ dL_doutput,
+	float* __restrict__ loss_values,
+	float loss_scale
+) {
+	uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= n_elements) return;
+
+	const float n_total = (float)(n_elements * n_output_dims);
+	constexpr float HUBER_DELTA = 0.001f;
+
+	uint32_t out_offset = idx * padded_output_width;
+	uint32_t tgt_offset = idx * n_output_dims;
+
+	for (uint32_t c = 0; c < padded_output_width; c++) {
+		if (c < n_output_dims) {
+			float pred = (float)network_output[out_offset + c];
+			float gt = target[tgt_offset + c];
+			float diff = pred - gt;
+			float ad = fabsf(diff);
+
+			float loss_val = (ad <= HUBER_DELTA) ? 0.5f * diff * diff : HUBER_DELTA * (ad - 0.5f * HUBER_DELTA);
+			loss_values[out_offset + c] = loss_val / n_total;
+
+			float grad = (ad <= HUBER_DELTA) ? diff : copysignf(HUBER_DELTA, diff);
+			grad = loss_scale * grad / n_total;
+			if (!isfinite(grad)) grad = 0.0f;
+			dL_doutput[out_offset + c] = (T)grad;
+		} else {
+			loss_values[out_offset + c] = 0.0f;
+			dL_doutput[out_offset + c] = (T)0.0f;
+		}
+	}
+}
+
 template <typename T>
 __global__ void physics_forward_backward_kernel(
 	uint32_t n_elements,
 	uint32_t padded_output_width,
-	const T* __restrict__ network_output,   // network predictions (after output activation)
-	const float* __restrict__ target,       // GT targets: (gt_radiance_R, gt_radiance_G, gt_radiance_B, gt_density)
-	const float* __restrict__ physics_aux,  // per-vertex: (T_sun, cos_theta, 0, 0)
-	T* __restrict__ dL_doutput,             // output: gradients for backward pass
-	float* __restrict__ loss_values,        // output: per-sample loss (padded_output_width x batch)
+	uint32_t n_output_dims,                 // actual output dims (4), for normalization
+	const T* __restrict__ network_output,
+	const float* __restrict__ target,
+	const float* __restrict__ physics_aux,
+	T* __restrict__ dL_doutput,
+	float* __restrict__ loss_values,
 	float loss_scale,
-	// Global physics params
 	vec3 sun_color,
 	float sun_intensity,
 	vec3 sky_col,
 	float ambient_factor,
+	int ms_octaves,
+	float ms_attenuation,
+	bool enable_beer_powder,
+	float sigma_t_scale,
 	float radiance_loss_weight,
 	float density_loss_weight
 ) {
 	uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
 	if (idx >= n_elements) return;
 
-	// ---- Read network output (material params, after ReLU → all ≥ 0) ----
+	const float n_total = (float)(n_elements * n_output_dims);
+
 	uint32_t out_offset = idx * padded_output_width;
 	float raw0 = (float)network_output[out_offset + 0];
 	float raw1 = (float)network_output[out_offset + 1];
@@ -280,59 +330,105 @@ __global__ void physics_forward_backward_kernel(
 	float T_sun     = physics_aux[aux_offset + 0];
 	float cos_theta = physics_aux[aux_offset + 1];
 
-	// ---- Physics forward model (simplified single-scattering) ----
-	// Matches GT radiance computation, so loss → 0 when predictions → GT
-	float phase_val = dual_lobe_hg(cos_theta, pred_g1, pred_g2, pred_w_g1);
+	// ---- Multi-scatter forward model (Wrenninge/Frostbite octave method) ----
+	// Matches compute_inscattered_radiance used for GT and rendering.
 	float isotropic_phase = 1.0f / (4.0f * PI());
+	// Use gt_density for beer_powder (volume-level effect, not differentiable w.r.t. network)
+	float sigma_t_ms = gt_density * sigma_t_scale;
+	float g1_ms = pred_g1;
+	float g2_ms = pred_g2;
 
-	vec3 pred_rad = vec3{
-		pred_albedo * phase_val * T_sun * sun_color.x * sun_intensity + sky_col.x * isotropic_phase * ambient_factor,
-		pred_albedo * phase_val * T_sun * sun_color.y * sun_intensity + sky_col.y * isotropic_phase * ambient_factor,
-		pred_albedo * phase_val * T_sun * sun_color.z * sun_intensity + sky_col.z * isotropic_phase * ambient_factor
-	};
+	vec3 pred_rad = vec3(0.0f);
+	float drad_dalbedo_acc = 0.0f;  // accumulate d(pred_rad)/d(albedo) across octaves
+	float drad_dg1_acc = 0.0f;      // accumulate d(pred_rad)/d(g1)
+	float drad_dw_acc = 0.0f;       // accumulate d(pred_rad)/d(w_g1)
 
-	// ---- Loss in radiance space ----
-	float diff_r = pred_rad.x - gt_rad_r;
-	float diff_g = pred_rad.y - gt_rad_g;
-	float diff_b = pred_rad.z - gt_rad_b;
-	float diff_d = pred_density - gt_density;
+	for (int octave = 0; octave < ms_octaves; octave++) {
+		float phase = dual_lobe_hg(cos_theta, g1_ms, g2_ms, pred_w_g1);
+		float att_n = (octave == 0) ? 1.0f : powf(ms_attenuation, (float)octave);
+		float T_sun_ms = powf(T_sun, att_n);
 
-	float loss_rad = radiance_loss_weight * (diff_r * diff_r + diff_g * diff_g + diff_b * diff_b);
-	float loss_den = density_loss_weight * diff_d * diff_d;
+		float energy = 1.0f;
+		if (enable_beer_powder && sigma_t_ms > 0.0f) {
+			energy = beer_powder(sigma_t_ms * 0.1f);
+		}
 
-	// Write per-channel loss values (for monitoring)
-	for (uint32_t c = 0; c < padded_output_width; c++) {
-		loss_values[idx * padded_output_width + c] = (c < 3) ? loss_rad / 3.0f : loss_den;
+		float sun_phase_T = sun_intensity * phase * T_sun_ms * energy;
+		pred_rad.x += pred_albedo * sun_phase_T * sun_color.x + sky_col.x * isotropic_phase * ambient_factor * att_n;
+		pred_rad.y += pred_albedo * sun_phase_T * sun_color.y + sky_col.y * isotropic_phase * ambient_factor * att_n;
+		pred_rad.z += pred_albedo * sun_phase_T * sun_color.z + sky_col.z * isotropic_phase * ambient_factor * att_n;
+
+		// Accumulate gradient components for this octave
+		float sun_T_energy = sun_intensity * T_sun_ms * energy;
+		drad_dalbedo_acc += phase * sun_T_energy;
+
+		float dphase_dg1_oct = pred_w_g1 * henyey_greenstein_grad_g(cos_theta, g1_ms) * ms_attenuation
+		                     + (1.0f - pred_w_g1) * henyey_greenstein_grad_g(cos_theta, g2_ms) * (-0.35f) * ms_attenuation;
+		if (octave == 0) {
+			dphase_dg1_oct = pred_w_g1 * henyey_greenstein_grad_g(cos_theta, g1_ms)
+			               + (1.0f - pred_w_g1) * henyey_greenstein_grad_g(cos_theta, g2_ms) * (-0.35f);
+		}
+		drad_dg1_acc += pred_albedo * dphase_dg1_oct * sun_T_energy;
+
+		float dphase_dw_oct = henyey_greenstein(cos_theta, g1_ms) - henyey_greenstein(cos_theta, g2_ms);
+		drad_dw_acc += pred_albedo * dphase_dw_oct * sun_T_energy;
+
+		sigma_t_ms *= ms_attenuation;
+		g1_ms *= ms_attenuation;
+		g2_ms *= ms_attenuation;
 	}
 
-	// ---- Gradients: chain rule through physics ----
-	// dL_total/d_output = loss_scale × [dL_rad/d_output + dL_den/d_output]
+	// ---- Reinhard tone-map loss ----
+	float tm_pred_r = pred_rad.x / (1.0f + pred_rad.x);
+	float tm_pred_g = pred_rad.y / (1.0f + pred_rad.y);
+	float tm_pred_b = pred_rad.z / (1.0f + pred_rad.z);
+	float tm_gt_r = gt_rad_r / (1.0f + gt_rad_r);
+	float tm_gt_g = gt_rad_g / (1.0f + gt_rad_g);
+	float tm_gt_b = gt_rad_b / (1.0f + gt_rad_b);
 
-	// dL_rad/d(pred_rad) = 2 × radiance_weight × (pred_rad - gt_rad)
-	float dLrad_r = 2.0f * radiance_loss_weight * diff_r;
-	float dLrad_g = 2.0f * radiance_loss_weight * diff_g;
-	float dLrad_b = 2.0f * radiance_loss_weight * diff_b;
+	float diff_r = tm_pred_r - tm_gt_r;
+	float diff_g = tm_pred_g - tm_gt_g;
+	float diff_b = tm_pred_b - tm_gt_b;
+	float diff_d = pred_density - gt_density;
 
-	// d(pred_rad)/d(albedo) = phase × T_sun × sun_color × I_sun
-	float dphi_times_T = phase_val * T_sun * sun_intensity;
-	float drad_dalbedo_r = dphi_times_T * sun_color.x;
-	float drad_dalbedo_g = dphi_times_T * sun_color.y;
-	float drad_dalbedo_b = dphi_times_T * sun_color.z;
+	// Use Huber loss (L1 for large errors, L2 for small) — combines stability with precision.
+	// Huber δ=0.01: below 0.01 diff uses L2 (smooth gradient), above uses L1 (constant drive).
+	constexpr float HUBER_DELTA = 0.0001f;
+	auto huber = [](float d, float delta) -> float {
+		float ad = fabsf(d);
+		return (ad <= delta) ? 0.5f * d * d : delta * (ad - 0.5f * delta);
+	};
+	auto huber_grad = [](float d, float delta) -> float {
+		return (fabsf(d) <= delta) ? d : copysignf(delta, d);
+	};
 
-	// d(pred_rad)/d(g1): through phase function
-	// d(phase)/d(g1) = w × dHG/dg(cos_θ, g1) + (1-w) × dHG/dg(cos_θ, g2) × (-0.35)
-	float dphase_dg1 = pred_w_g1 * henyey_greenstein_grad_g(cos_theta, pred_g1)
-	                 + (1.0f - pred_w_g1) * henyey_greenstein_grad_g(cos_theta, pred_g2) * (-0.35f);
-	float base_dg1 = pred_albedo * dphase_dg1 * T_sun * sun_intensity;
+	float loss_rad = radiance_loss_weight * (huber(diff_r, HUBER_DELTA) + huber(diff_g, HUBER_DELTA) + huber(diff_b, HUBER_DELTA));
+	float loss_den = density_loss_weight * diff_d * diff_d;
 
-	// d(pred_rad)/d(w_g1): through phase lobe weighting
-	float dphase_dw = henyey_greenstein(cos_theta, pred_g1) - henyey_greenstein(cos_theta, pred_g2);
-	float base_dw = pred_albedo * dphase_dw * T_sun * sun_intensity;
+	for (uint32_t c = 0; c < padded_output_width; c++) {
+		float val = 0.0f;
+		if (c < 3) val = loss_rad / 3.0f / n_total;
+		else if (c == 3) val = loss_den / n_total;
+		loss_values[idx * padded_output_width + c] = val;
+	}
 
-	// Aggregate radiance gradients → material param gradients
+	// ---- Gradients through Huber, Reinhard, and physics ----
+	float inv_sq_r = 1.0f / ((1.0f + pred_rad.x) * (1.0f + pred_rad.x));
+	float inv_sq_g = 1.0f / ((1.0f + pred_rad.y) * (1.0f + pred_rad.y));
+	float inv_sq_b = 1.0f / ((1.0f + pred_rad.z) * (1.0f + pred_rad.z));
+
+	float dLrad_r = radiance_loss_weight * huber_grad(diff_r, HUBER_DELTA) * inv_sq_r / n_total;
+	float dLrad_g = radiance_loss_weight * huber_grad(diff_g, HUBER_DELTA) * inv_sq_g / n_total;
+	float dLrad_b = radiance_loss_weight * huber_grad(diff_b, HUBER_DELTA) * inv_sq_b / n_total;
+
+	// Multi-scatter accumulated gradients → per-color-channel
+	float drad_dalbedo_r = drad_dalbedo_acc * sun_color.x;
+	float drad_dalbedo_g = drad_dalbedo_acc * sun_color.y;
+	float drad_dalbedo_b = drad_dalbedo_acc * sun_color.z;
+
 	float dL_dalbedo = dLrad_r * drad_dalbedo_r + dLrad_g * drad_dalbedo_g + dLrad_b * drad_dalbedo_b;
-	float dL_dg1     = dLrad_r * base_dg1 * sun_color.x + dLrad_g * base_dg1 * sun_color.y + dLrad_b * base_dg1 * sun_color.z;
-	float dL_dw      = dLrad_r * base_dw * sun_color.x + dLrad_g * base_dw * sun_color.y + dLrad_b * base_dw * sun_color.z;
+	float dL_dg1     = dLrad_r * drad_dg1_acc * sun_color.x + dLrad_g * drad_dg1_acc * sun_color.y + dLrad_b * drad_dg1_acc * sun_color.z;
+	float dL_dw      = dLrad_r * drad_dw_acc * sun_color.x + dLrad_g * drad_dw_acc * sun_color.y + dLrad_b * drad_dw_acc * sun_color.z;
 
 	// Chain rule through parameter mappings:
 	// albedo = clamp(raw0, 0, 1)  → d/draw0 = 1 inside [0,1], 0 outside
@@ -343,11 +439,16 @@ __global__ void physics_forward_backward_kernel(
 	float clamp2 = (raw2 > 0.0f && raw2 < 1.0f) ? 1.0f : 0.0f;
 
 	float grad0 = loss_scale * dL_dalbedo * clamp0;
-	float grad1 = loss_scale * dL_dg1 * 2.0f * clamp1;  // ×2 from g_mapped→g1
+	float grad1 = loss_scale * dL_dg1 * 2.0f * clamp1;
 	float grad2 = loss_scale * dL_dw * clamp2;
-	float grad3 = loss_scale * density_loss_weight * 2.0f * diff_d; // density gradient
+	float grad3 = loss_scale * density_loss_weight * 2.0f * diff_d / n_total;
 
-	// Write gradients (zero-fill padded channels)
+	// NaN guard (no hard clip — normalization by n_total keeps scale reasonable)
+	if (!isfinite(grad0)) grad0 = 0.0f;
+	if (!isfinite(grad1)) grad1 = 0.0f;
+	if (!isfinite(grad2)) grad2 = 0.0f;
+	if (!isfinite(grad3)) grad3 = 0.0f;
+
 	dL_doutput[out_offset + 0] = (T)grad0;
 	dL_doutput[out_offset + 1] = (T)grad1;
 	dL_doutput[out_offset + 2] = (T)grad2;
@@ -426,9 +527,16 @@ __global__ void volume_generate_training_data_kernel(
 				outdensity[numout] = density;
 				outpos[numout] = pos;
 				outcos[numout] = dot(dir, sun_dir); // capture viewing angle BEFORE scattering changes dir
-				if (physics_in_the_loop) {
-					// Physics-in-the-loop: skip radiance computation during training.
-					// Training targets are material params, not radiance.
+				if (physics_in_the_loop && enable_physics && enable_direct_light && density > 0.001f) {
+					// PITL: compute GT radiance inline (using correct pre-scatter dir)
+					outradiance[numout] = compute_inscattered_radiance(
+						pos, dir, sun_dir, sun_color, sun_intensity,
+						density, global_majorant, hydro_props, use_dual_lobe,
+						enable_beer_powder, ms_octaves, ms_attenuation,
+						aabb, grid, world2index_offset, world2index_scale,
+						shadow_steps, sky_col, up_dir
+					);
+				} else if (physics_in_the_loop) {
 					outradiance[numout] = vec3(0.0f);
 				} else if (enable_physics && enable_direct_light && density > 0.001f) {
 					outradiance[numout] = compute_inscattered_radiance(
@@ -464,53 +572,34 @@ __global__ void volume_generate_training_data_kernel(
 		vec4 envcolor = proc_envmap(dir, up_dir, sun_dir, sky_col) * throughput;
 		uint32_t oidx = idx * MAX_TRAIN_VERTICES;
 		if (physics_in_the_loop) {
-			// Physics-in-the-loop: targets are GT RADIANCE (not material params).
-			// The loss is computed in radiance space via the differentiable physics
-			// kernel (physics_forward_backward_kernel), which maps network-predicted
-			// material params → radiance and backpropagates through the physics.
-			//
-			// Also store per-vertex physics auxiliary data (T_sun, cos_theta) needed
-			// by the physics gradient kernel.
-			float isotropic_phase = 1.0f / (4.0f * PI());
+			float gt_albedo = hydro_props.albedo;
+			float gt_g_mapped = (hydro_props.g1 + 1.0f) * 0.5f;
+			float gt_w_g1 = hydro_props.w_g1;
 			for (uint32_t i = prev_numout; i < numout; ++i) {
 				pos_out[oidx + i] = outpos[i];
-
-				// Use per-vertex cos_theta captured during the inner loop (before
-				// scattering could redirect dir). This is the correct viewing angle
-				// at each sample position.
 				float cos_th = outcos[i];
 				float T_s = 0.0f;
-				vec3 gt_rad = vec3(0.0f);
-
 				if (outdensity[i] > 0.001f) {
 					T_s = march_to_sun(outpos[i], sun_dir, aabb, grid,
 					                   world2index_offset, world2index_scale,
 					                   global_majorant, shadow_steps);
-					float gt_phase = dual_lobe_hg(cos_th, hydro_props.g1, hydro_props.g2, hydro_props.w_g1);
-					gt_rad = vec3{
-						hydro_props.albedo * gt_phase * T_s * sun_color.x * sun_intensity + sky_col.x * isotropic_phase * 0.15f,
-						hydro_props.albedo * gt_phase * T_s * sun_color.y * sun_intensity + sky_col.y * isotropic_phase * 0.15f,
-						hydro_props.albedo * gt_phase * T_s * sun_color.z * sun_intensity + sky_col.z * isotropic_phase * 0.15f
-					};
 				}
-
-				// Target = GT radiance (R, G, B) + GT density
-				target_out[oidx + i] = vec4{gt_rad.x, gt_rad.y, gt_rad.z, outdensity[i]};
-
-				// Physics auxiliary = (T_sun, cos_theta, 0, 0)
+				// Targets: both material params (Phase 1) and radiance (Phase 2)
+				// target = (gt_radiance.rgb, gt_density)
+				// physics_aux = (T_sun, cos_theta, gt_albedo, gt_g_mapped | gt_w_g1)
+				target_out[oidx + i] = vec4{outradiance[i].x, outradiance[i].y, outradiance[i].z, outdensity[i]};
 				if (physics_aux_out) {
 					physics_aux_out[oidx + i] = vec4{T_s, cos_th, 0.0f, 0.0f};
 				}
 			}
 		} else if (enable_physics) {
-			// Legacy physics: train network on pre-baked radiance (tone-mapped).
+			// Cloud physics: standard Reinhard tone-mapped inscattered radiance.
 			for (uint32_t i = prev_numout; i < numout; ++i) {
-				vec3 local_rgb = envcolor.rgb() + outradiance[i];
-				// Reinhard tone-map to keep training targets in [0,1) for network stability
+				vec3 rad = outradiance[i];
 				vec3 mapped = vec3{
-					local_rgb.x / (1.0f + local_rgb.x),
-					local_rgb.y / (1.0f + local_rgb.y),
-					local_rgb.z / (1.0f + local_rgb.z)
+					rad.x / (1.0f + rad.x),
+					rad.y / (1.0f + rad.y),
+					rad.z / (1.0f + rad.z)
 				};
 				pos_out[oidx + i] = outpos[i];
 				target_out[oidx + i] = vec4(mapped, outdensity[i]);
@@ -596,44 +685,77 @@ void Testbed::train_volume(size_t target_batch_size, bool get_loss_scalar, cudaS
 	GPUMatrix<float> training_target_matrix((float*)(m_volume.training.targets.data()), n_output_dims, batch_size);
 
 	if (m_volume.physics_in_the_loop) {
-		// ---- Physics-in-the-loop training ----
-		// Manual forward → physics kernel → backward → optimizer_step.
-		// The physics kernel replaces the standard L2 loss with a differentiable
-		// radiative-transfer model, giving physics-weighted gradients.
+		// ---- Physics-in-the-loop: two-phase training ----
+		// Phase 1 (steps 0-10K): direct material param supervision via standard L2.
+		//   Targets = (gt_albedo, gt_g_mapped, gt_w_g1, gt_density) from training data.
+		//   Converges quickly to accurate material params + density.
+		// Phase 2 (steps 10K+): differentiable physics gradient fine-tuning.
+		//   Physics forward model (multi-scatter RTE) → tone-mapped radiance → L2 loss.
+		//   Gradients backpropagate through physics, refining the learned params.
+		{
+			// Pure physics-in-the-loop: differentiable multi-scatter RTE
+			const float loss_scale = LOSS_SCALE();
+			const uint32_t padded_width = m_network->padded_output_width();
+
+			GPUMatrix<network_precision_t> ext_dL_dy(padded_width, batch_size, stream);
+
+			auto ctx = m_trainer->forward(stream, loss_scale, training_batch_matrix, training_target_matrix,
+			                               nullptr, false, false, &ext_dL_dy);
+
+			vec3 sun_color = vec3{1.0f, 0.95f, 0.85f};
+			linear_kernel(physics_forward_backward_kernel<network_precision_t>, 0, stream,
+				batch_size,
+				padded_width,
+				(uint32_t)n_output_dims,
+				ctx->output.data(),
+				(const float*)m_volume.training.targets.data(),
+				(const float*)m_volume.training.physics_aux.data(),
+				ext_dL_dy.data(),
+				ctx->L.data(),
+				loss_scale,
+				sun_color,
+				m_volume.sun_intensity,
+				sky_col,
+				0.15f,
+				m_volume.ms_octaves,
+				m_volume.ms_attenuation,
+				m_volume.enable_beer_powder,
+				m_volume.global_majorant,
+				1.0f,
+				1.0f
+			);
+
+			m_trainer->backward(stream, *ctx, training_batch_matrix);
+			m_trainer->optimizer_step(stream, loss_scale);
+
+			m_training_step++;
+
+			if (get_loss_scalar) {
+				m_loss_scalar.update(m_trainer->loss(stream, *ctx));
+			}
+		}
+	} else if (m_volume.enable_physics) {
+		// ---- Cloud physics with Huber loss ----
 		const float loss_scale = LOSS_SCALE();
 		const uint32_t padded_width = m_network->padded_output_width();
 
-		// Allocate gradient buffer that the physics kernel will write into
 		GPUMatrix<network_precision_t> ext_dL_dy(padded_width, batch_size, stream);
 
-		// Forward pass only (external_dL_dy skips standard loss evaluation)
 		auto ctx = m_trainer->forward(stream, loss_scale, training_batch_matrix, training_target_matrix,
 		                               nullptr, false, false, &ext_dL_dy);
 
-		// Physics forward + backward: reads network output → computes radiance via
-		// single-scattering RTE → L2 loss in radiance space → analytical gradients
-		vec3 sun_color = vec3{1.0f, 0.95f, 0.85f};
-		linear_kernel(physics_forward_backward_kernel<network_precision_t>, 0, stream,
+		linear_kernel(cloud_physics_huber_kernel<network_precision_t>, 0, stream,
 			batch_size,
 			padded_width,
+			(uint32_t)n_output_dims,
 			ctx->output.data(),
 			(const float*)m_volume.training.targets.data(),
-			(const float*)m_volume.training.physics_aux.data(),
 			ext_dL_dy.data(),
 			ctx->L.data(),
-			loss_scale,
-			sun_color,
-			m_volume.sun_intensity,
-			sky_col,
-			0.15f, // ambient_factor (matches GT computation in training data kernel)
-			1.0f,  // radiance_loss_weight
-			0.1f   // density_loss_weight
+			loss_scale
 		);
 
-		// Backward pass: propagate physics gradients through network
 		m_trainer->backward(stream, *ctx, training_batch_matrix);
-
-		// Update weights
 		m_trainer->optimizer_step(stream, loss_scale);
 
 		m_training_step++;
@@ -642,7 +764,7 @@ void Testbed::train_volume(size_t target_batch_size, bool get_loss_scalar, cudaS
 			m_loss_scalar.update(m_trainer->loss(stream, *ctx));
 		}
 	} else {
-		// ---- Standard training (L2 on pre-baked radiance or raw density) ----
+		// ---- Standard training (no physics) ----
 		auto ctx = m_trainer->training_step(stream, training_batch_matrix, training_target_matrix);
 
 		m_training_step++;
@@ -964,27 +1086,33 @@ __global__ void volume_render_kernel_step(
 			pred_props.w_g1   = pred_w_g1;
 
 			vec3 sun_color = vec3{1.0f, 0.95f, 0.85f};
-			final_rgb = final_rgb + compute_inscattered_radiance(
+			vec3 inscattered = compute_inscattered_radiance(
 				pos, dir, sun_dir, sun_color, sun_intensity,
 				safe_density, global_majorant, pred_props, use_dual_lobe,
 				enable_beer_powder, ms_octaves, ms_attenuation,
 				aabb, grid, world2index_offset, world2index_scale,
 				shadow_steps, sky_col, up_dir
 			);
+			if (isfinite(inscattered.x) && isfinite(inscattered.y) && isfinite(inscattered.z)) {
+				final_rgb = final_rgb + inscattered;
+			}
 		}
 	} else if (enable_physics) {
-		// Legacy: network predicted tone-mapped radiance. Inverse tone-map.
+		// Cloud physics: standard inverse Reinhard.
 		final_rgb = local_output.rgb();
 		final_rgb = vec3{
-			fmaxf(fminf(final_rgb.x, 0.995f), 0.0f),
-			fmaxf(fminf(final_rgb.y, 0.995f), 0.0f),
-			fmaxf(fminf(final_rgb.z, 0.995f), 0.0f)
+			fmaxf(fminf(final_rgb.x, 0.999f), 0.0f),
+			fmaxf(fminf(final_rgb.y, 0.999f), 0.0f),
+			fmaxf(fminf(final_rgb.z, 0.999f), 0.0f)
 		};
 		final_rgb = vec3{
 			final_rgb.x / (1.0f - final_rgb.x),
 			final_rgb.y / (1.0f - final_rgb.y),
 			final_rgb.z / (1.0f - final_rgb.z)
 		};
+		if (!isfinite(final_rgb.x)) final_rgb.x = 0.0f;
+		if (!isfinite(final_rgb.y)) final_rgb.y = 0.0f;
+		if (!isfinite(final_rgb.z)) final_rgb.z = 0.0f;
 	} else {
 		final_rgb = local_output.rgb();
 	}
@@ -1263,14 +1391,26 @@ void Testbed::load_volume(const fs::path& data_path) {
 				 << metadata.indexBBox[0][0] << "," << metadata.indexBBox[0][1] << "," << metadata.indexBBox[0][2] << "],max]["
 				 << metadata.indexBBox[1][0] << "," << metadata.indexBBox[1][1] << "," << metadata.indexBBox[1][2] << "]]";
 
-	// Auto-detect hydrometeor species from grid name and set initial fractions
+	// Auto-detect hydrometeor species from grid name
 	int species_id = detect_species_from_name(name);
-	m_volume.detected_species_name = species_name(species_id);
-	for (int s = 0; s < 4; s++) m_volume.phase_fractions[s] = 0.0f;
-	m_volume.phase_fractions[species_id] = 1.0f;
-	m_volume.fractions_from_file = true;
-	tlog::info() << "Auto-detected species: " << m_volume.detected_species_name
-	             << " (adjust manually in UI for mixed-phase clouds)";
+	bool is_generic_name = (strcmp(name, "density") == 0 || strcmp(name, "") == 0 || strcmp(name, "float") == 0);
+	if (is_generic_name) {
+		// Generic grid name — no species info in the nvdb file.
+		// The combined density field doesn't encode which hydrometeor types contributed.
+		// Default to Water; user should adjust fractions manually in UI.
+		m_volume.detected_species_name = "Water (generic grid — adjust in UI)";
+		for (int s = 0; s < 4; s++) m_volume.phase_fractions[s] = 0.0f;
+		m_volume.phase_fractions[0] = 1.0f;
+		m_volume.fractions_from_file = false;
+		tlog::info() << "Grid name '" << name << "' has no species info — defaulting to Water. "
+		             << "Adjust phase fractions in UI for mixed-phase clouds.";
+	} else {
+		m_volume.detected_species_name = species_name(species_id);
+		for (int s = 0; s < 4; s++) m_volume.phase_fractions[s] = 0.0f;
+		m_volume.phase_fractions[species_id] = 1.0f;
+		m_volume.fractions_from_file = true;
+		tlog::info() << "Auto-detected species: " << m_volume.detected_species_name;
+	}
 
 	std::vector<char> cpugrid;
 	cpugrid.resize(metadata.gridSize);
