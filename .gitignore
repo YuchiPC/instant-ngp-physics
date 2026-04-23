@@ -27,3 +27,4 @@ __pycache__
 imgui.ini
 
 .claude
+data/nvdb/
