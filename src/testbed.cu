@@ -65,6 +65,8 @@
 #undef max
 #undef near
 #undef far
+#undef None
+#undef Success
 
 
 using namespace std::literals::chrono_literals;
@@ -438,6 +440,104 @@ void Testbed::translate_camera(const vec3& rel, const mat3& rot, bool allow_up_d
 }
 
 void Testbed::set_nerf_camera_matrix(const mat4x3& cam) { m_camera = m_nerf.training.dataset.nerf_matrix_to_ngp(cam); }
+
+void Testbed::set_camera_to_goes_east_view(float lat_deg, float lon_deg) {
+	// GOES-East (GOES-16) geostationary position
+	constexpr float GOES_LAT = 0.0f;
+	constexpr float GOES_LON = -75.2f;  // degrees
+	constexpr float GOES_ALT = 35786.0f; // km
+	constexpr float R_EARTH  = 6371.0f;  // km
+	constexpr float DEG2RAD  = 3.14159265358979f / 180.0f;
+
+	// Geodetic to ECEF (spherical Earth)
+	auto to_ecef = [&](float lat_d, float lon_d, float alt_km) -> vec3 {
+		float la = lat_d * DEG2RAD, lo = lon_d * DEG2RAD;
+		float r = R_EARTH + alt_km;
+		return {r * cosf(la) * cosf(lo), r * cosf(la) * sinf(lo), r * sinf(la)};
+	};
+
+	vec3 sat_ecef = to_ecef(GOES_LAT, GOES_LON, GOES_ALT);
+	vec3 roi_ecef = to_ecef(lat_deg, lon_deg, 0.0f);
+	vec3 d_ecef = sat_ecef - roi_ecef; // ground-to-satellite in ECEF
+
+	// ECEF to ENU rotation at (lat, lon)
+	float la = lat_deg * DEG2RAD, lo = lon_deg * DEG2RAD;
+	float sl = sinf(la), cl = cosf(la), so = sinf(lo), co = cosf(lo);
+
+	vec3 enu_e = {-so,      co,       0.0f};
+	vec3 enu_n = {-sl * co, -sl * so, cl};
+	vec3 enu_u = { cl * co,  cl * so, sl};
+
+	vec3 to_sat_enu = {
+		dot(enu_e, d_ecef),
+		dot(enu_n, d_ecef),
+		dot(enu_u, d_ecef),
+	};
+
+	float sat_dist = length(to_sat_enu);
+	vec3 view_dir_enu = -to_sat_enu / sat_dist; // satellite-to-ground in ENU
+
+	// Store computed angles for display
+	m_volume.sat_zenith_deg  = acosf(fminf(-view_dir_enu.z, 1.0f)) / DEG2RAD;
+	m_volume.sat_azimuth_deg = atan2f(view_dir_enu.x, view_dir_enu.y) / DEG2RAD;
+
+	// Build orthonormal camera basis in ENU (= volume XYZ: East→+X, North→+Y, Up→+Z)
+	vec3 forward = view_dir_enu;
+	vec3 up_hint = {0.0f, 0.0f, 1.0f};
+	vec3 right_raw = cross(up_hint, forward);
+	// Degenerate when looking straight down (sub-satellite point): use North as fallback
+	if (length(right_raw) < 1e-6f) {
+		up_hint = {0.0f, 1.0f, 0.0f};
+		right_raw = cross(up_hint, forward);
+	}
+	vec3 right = normalize(right_raw);
+	vec3 up = normalize(cross(forward, right));
+
+	// Volume center and extent in NGP space
+	vec3 center = (m_render_aabb.min + m_render_aabb.max) * 0.5f;
+	vec3 extent = m_render_aabb.max - m_render_aabb.min;
+	float diag = length(extent);
+
+	// Place camera behind the volume along view direction
+	vec3 pos = center - forward * diag;
+
+	// Set camera matrix: columns [right | up | forward | position]
+	m_camera[0] = right;
+	m_camera[1] = up;
+	m_camera[2] = forward;
+	m_camera[3] = pos;
+
+	// Switch to orthographic lens
+	m_render_with_lens_distortion = true;
+	m_render_lens.mode = ELensMode::Orthographic;
+
+	m_smoothed_camera = m_camera;
+	reset_accumulation(true);
+}
+
+void Testbed::set_camera_to_top_down_view() {
+	vec3 center = (m_render_aabb.min + m_render_aabb.max) * 0.5f;
+	vec3 extent = m_render_aabb.max - m_render_aabb.min;
+	float diag = length(extent);
+
+	vec3 forward = {0.0f, 0.0f, -1.0f};
+	vec3 up_hint = {0.0f, 1.0f, 0.0f};
+	vec3 right = normalize(cross(up_hint, forward));
+	vec3 up = normalize(cross(forward, right));
+
+	vec3 pos = center - forward * diag;
+
+	m_camera[0] = right;
+	m_camera[1] = up;
+	m_camera[2] = forward;
+	m_camera[3] = pos;
+
+	m_render_with_lens_distortion = true;
+	m_render_lens.mode = ELensMode::Orthographic;
+
+	m_smoothed_camera = m_camera;
+	reset_accumulation(true);
+}
 
 vec3 Testbed::look_at() const { return view_pos() + view_dir() * m_scale; }
 
@@ -1265,11 +1365,120 @@ void Testbed::imgui() {
 		}
 
 		if (m_testbed_mode == ETestbedMode::Volume && ImGui::TreeNode("Volume training options")) {
-			accum_reset |= ImGui::SliderFloat("Albedo", &m_volume.albedo, 0.f, 1.f);
-			accum_reset |= ImGui::SliderFloat("Scattering", &m_volume.scattering, -2.f, 2.f);
+			// === PHYSICS ON/OFF TOGGLE (for A/B comparison) ===
+			accum_reset |= ImGui::Checkbox("Enable Cloud Physics", &m_volume.enable_physics);
+			if (!m_volume.enable_physics) {
+				ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.0f, 1.0f), "Physics OFF: original rendering");
+				// Auto-disable physics-in-the-loop when physics is turned off
+				// (network output semantics would be wrong otherwise)
+				if (m_volume.physics_in_the_loop) {
+					m_volume.physics_in_the_loop = false;
+					reload_network_from_file();
+				}
+			}
+
+			if (m_volume.enable_physics) {
+				bool old_pitl = m_volume.physics_in_the_loop;
+				accum_reset |= ImGui::Checkbox("Physics-in-the-Loop", &m_volume.physics_in_the_loop);
+				if (m_volume.physics_in_the_loop != old_pitl) {
+					// Network output semantics changed (material params ↔ radiance).
+					// Must reset network weights — old weights predict the wrong thing.
+					reload_network_from_file();
+				}
+				if (m_volume.physics_in_the_loop) {
+					ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f),
+						"Network predicts materials; renderer evaluates RTE");
+					ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f),
+						"Relighting: change sun dir/intensity at any time");
+				}
+			}
+
 			accum_reset |= ImGui::SliderFloat(
 				"Distance scale", &m_volume.inv_distance_scale, 1.f, 100.f, "%.3g", ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_NoRoundToFormat
 			);
+
+			if (m_volume.enable_physics) {
+				// === Auto-detected species info ===
+				if (!m_volume.detected_species_name.empty()) {
+					ImGui::Text("Detected species: %s", m_volume.detected_species_name.c_str());
+				}
+
+				if (ImGui::TreeNode("Cloud Microphysics")) {
+					if (m_volume.fractions_from_file) {
+						ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Initial mix set from grid name");
+					}
+					ImGui::Text("Hydrometeor Mix (auto-normalized):");
+					accum_reset |= ImGui::SliderFloat("Water droplets", &m_volume.phase_fractions[0], 0.f, 1.f);
+					accum_reset |= ImGui::SliderFloat("Ice crystals",   &m_volume.phase_fractions[1], 0.f, 1.f);
+					accum_reset |= ImGui::SliderFloat("Snow",           &m_volume.phase_fractions[2], 0.f, 1.f);
+					accum_reset |= ImGui::SliderFloat("Graupel",        &m_volume.phase_fractions[3], 0.f, 1.f);
+					float sum = m_volume.phase_fractions[0] + m_volume.phase_fractions[1] +
+					            m_volume.phase_fractions[2] + m_volume.phase_fractions[3];
+					if (sum > 0.0f) {
+						for (int i = 0; i < 4; i++) m_volume.phase_fractions[i] /= sum;
+					}
+					ImGui::Separator();
+					ImGui::Text("Manual Overrides (0 = use blended):");
+					accum_reset |= ImGui::SliderFloat("Albedo override",     &m_volume.albedo_override, 0.f, 1.f);
+					accum_reset |= ImGui::SliderFloat("HG g override",       &m_volume.g_override, -1.f, 1.f);
+					accum_reset |= ImGui::Checkbox("Dual-lobe phase fn",     &m_volume.use_dual_lobe);
+					ImGui::TreePop();
+				}
+
+				if (ImGui::TreeNode("Lighting & Scattering")) {
+					accum_reset |= ImGui::Checkbox("Direct sun lighting",    &m_volume.enable_direct_light);
+					accum_reset |= ImGui::SliderFloat("Sun intensity",       &m_volume.sun_intensity, 0.f, 100.f, "%.1f");
+					accum_reset |= ImGui::SliderInt("Shadow ray steps",      &m_volume.shadow_steps, 4, 128);
+					accum_reset |= ImGui::SliderInt("Multi-scatter octaves", &m_volume.ms_octaves, 0, 8);
+					accum_reset |= ImGui::SliderFloat("MS attenuation",      &m_volume.ms_attenuation, 0.1f, 1.f);
+					accum_reset |= ImGui::Checkbox("Beer-Powder edges",      &m_volume.enable_beer_powder);
+					ImGui::TreePop();
+				}
+			}
+
+			ImGui::TreePop();
+		}
+
+		if (m_testbed_mode == ETestbedMode::Volume && ImGui::TreeNode("Satellite View (GOES-East)")) {
+			ImGui::Text("Match camera to GOES-East viewing angle");
+			ImGui::Separator();
+
+			accum_reset |= ImGui::InputFloat("Latitude (deg N)", &m_volume.sat_roi_lat, 0.1f, 1.0f, "%.4f");
+			accum_reset |= ImGui::InputFloat("Longitude (deg E)", &m_volume.sat_roi_lon, 0.1f, 1.0f, "%.4f");
+
+			static bool sat_camera_set = false;
+			if (ImGui::Button("Set GOES-East Camera")) {
+				set_camera_to_goes_east_view(m_volume.sat_roi_lat, m_volume.sat_roi_lon);
+				sat_camera_set = true;
+				accum_reset = true;
+			}
+
+			if (sat_camera_set) {
+				float elevation = 90.0f - m_volume.sat_zenith_deg;
+				ImGui::Text("Zenith: %.1f deg   Elevation: %.1f deg",
+					m_volume.sat_zenith_deg, elevation);
+				ImGui::Text("Azimuth: %.1f deg from N", m_volume.sat_azimuth_deg);
+				if (elevation < 10.0f) {
+					ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+						"Warning: low satellite elevation — location may be outside GOES-East coverage");
+				} else {
+					float parallax_15km = 15.0f * tanf(m_volume.sat_zenith_deg * 3.14159f / 180.0f);
+					ImGui::Text("Parallax at 15km cloud: %.1f km", parallax_15km);
+				}
+			}
+
+			ImGui::TreePop();
+		}
+
+		if (m_testbed_mode == ETestbedMode::Volume && ImGui::TreeNode("Top-Down View")) {
+			ImGui::Text("Orthographic nadir (straight-down) camera");
+			ImGui::Separator();
+
+			if (ImGui::Button("Set Top-Down Camera")) {
+				set_camera_to_top_down_view();
+				accum_reset = true;
+			}
+
 			ImGui::TreePop();
 		}
 	}
@@ -3849,7 +4058,7 @@ void Testbed::init_vr() {
 
 		m_hmd = std::make_unique<OpenXRHMD>(xDisplay, visualInfo->visualid, glxFBConfig, glXGetCurrentDrawable(), glxContext);
 #	elif defined(XR_USE_PLATFORM_WAYLAND)
-		m_hmd = std::make_unique<OpenXRHMD>(glfwGetWaylandDisplay());
+		throw std::runtime_error{"VR is not supported in this WSL Wayland build."};
 #	endif
 
 		// Enable aggressive optimizations to make the VR experience smooth.

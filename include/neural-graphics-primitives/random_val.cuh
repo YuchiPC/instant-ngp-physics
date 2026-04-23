@@ -76,6 +76,129 @@ inline __host__ __device__ vec3 random_dir(RNG& rng) {
 	return cylindrical_to_dir(random_val_2d(rng));
 }
 
+// ============================================================================
+// Cloud microphysics: hydrometeor types and their optical properties
+// ============================================================================
+
+// Hydrometeor species that can exist in a cloud volume
+enum class EHydrometeorType : int {
+	Water   = 0, // liquid water droplets
+	Ice     = 1, // ice crystals (cirrus, anvil tops)
+	Snow    = 2, // snow aggregates
+	Graupel = 3, // graupel / soft hail
+	NumTypes = 4,
+};
+
+// Optical properties per hydrometeor type at visible wavelengths
+// Based on Mie theory for water, Yang et al. (2005) for ice habits
+struct HydrometeorProps {
+	float g1;     // primary HG asymmetry parameter (forward lobe)
+	float g2;     // secondary HG asymmetry parameter (backward lobe)
+	float w_g1;   // weight of forward lobe in dual-lobe blend
+	float albedo; // single-scattering albedo (omega = sigma_s / sigma_t)
+};
+
+// Canonical values from literature:
+//   Water: Mie g~0.85, nearly pure scattering at visible wavelengths
+//   Ice:   Yang et al. habit-averaged g~0.75, slight absorption
+//   Snow:  aggregates, more isotropic g~0.65, moderate absorption
+//   Graupel: dense ice, g~0.75, noticeable absorption
+__host__ __device__ inline HydrometeorProps get_hydrometeor_props(EHydrometeorType type) {
+	switch (type) {
+		case EHydrometeorType::Water:   return {0.85f, -0.30f, 0.70f, 0.9999f};
+		case EHydrometeorType::Ice:     return {0.75f, -0.20f, 0.80f, 0.990f};
+		case EHydrometeorType::Snow:    return {0.65f, -0.15f, 0.85f, 0.950f};
+		case EHydrometeorType::Graupel: return {0.75f, -0.25f, 0.75f, 0.920f};
+		default:                        return {0.85f, -0.30f, 0.70f, 0.9999f};
+	}
+}
+
+// Blend optical properties for mixed-phase clouds
+// fractions: [water, ice, snow, graupel], should sum to 1
+__host__ __device__ inline HydrometeorProps blend_hydrometeor_props(const float* fractions) {
+	HydrometeorProps result = {0.0f, 0.0f, 0.0f, 0.0f};
+	for (int i = 0; i < (int)EHydrometeorType::NumTypes; i++) {
+		HydrometeorProps p = get_hydrometeor_props((EHydrometeorType)i);
+		float f = fractions[i];
+		result.g1     += f * p.g1;
+		result.g2     += f * p.g2;
+		result.w_g1   += f * p.w_g1;
+		result.albedo += f * p.albedo;
+	}
+	return result;
+}
+
+// ============================================================================
+// Phase functions
+// ============================================================================
+
+// Single-lobe Henyey-Greenstein phase function
+// Returns probability density on the sphere for scattering angle cos_theta
+__host__ __device__ inline float henyey_greenstein(float cos_theta, float g) {
+	float g2 = g * g;
+	float denom = 1.0f + g2 - 2.0f * g * cos_theta;
+	return (1.0f / (4.0f * PI())) * (1.0f - g2) / (denom * sqrtf(fmaxf(denom, 1e-8f)));
+}
+
+// Dual-lobe HG: blends forward peak with backward glory
+// Captures both the strong forward scattering and the backward glory/rainbow
+// that single-lobe HG misses
+__host__ __device__ inline float dual_lobe_hg(float cos_theta, float g1, float g2, float w) {
+	return w * henyey_greenstein(cos_theta, g1) + (1.0f - w) * henyey_greenstein(cos_theta, g2);
+}
+
+// Phase function evaluation using hydrometeor properties
+__host__ __device__ inline float phase_function(float cos_theta, const HydrometeorProps& props) {
+	return dual_lobe_hg(cos_theta, props.g1, props.g2, props.w_g1);
+}
+
+// Importance-sample the single-lobe HG distribution
+// Returns a new direction scattered from `incident`
+template <typename RNG>
+__host__ __device__ inline vec3 sample_henyey_greenstein(const vec3& incident, float g, RNG& rng) {
+	float xi1 = random_val(rng);
+	float xi2 = random_val(rng);
+
+	float cos_theta;
+	if (fabsf(g) < 1e-4f) {
+		// isotropic limit
+		cos_theta = 1.0f - 2.0f * xi1;
+	} else {
+		float s = (1.0f - g * g) / (1.0f - g + 2.0f * g * xi1);
+		cos_theta = (1.0f + g * g - s * s) / (2.0f * g);
+	}
+	cos_theta = fminf(fmaxf(cos_theta, -1.0f), 1.0f);
+
+	float sin_theta = sqrtf(fmaxf(0.0f, 1.0f - cos_theta * cos_theta));
+	float phi = 2.0f * PI() * xi2;
+
+	// Build an orthonormal frame around the incident direction
+	vec3 w = normalize(incident);
+	vec3 helper = (fabsf(w.x) > 0.9f) ? vec3{0.0f, 1.0f, 0.0f} : vec3{1.0f, 0.0f, 0.0f};
+	vec3 u = normalize(cross(helper, w));
+	vec3 v = cross(w, u);
+
+	return normalize(u * (sin_theta * cosf(phi)) + v * (sin_theta * sinf(phi)) + w * cos_theta);
+}
+
+// Importance-sample the dual-lobe HG: pick a lobe probabilistically, then sample it
+template <typename RNG>
+__host__ __device__ inline vec3 sample_dual_lobe_hg(const vec3& incident, const HydrometeorProps& props, RNG& rng) {
+	float xi = random_val(rng);
+	float g = (xi < props.w_g1) ? props.g1 : props.g2;
+	return sample_henyey_greenstein(incident, g, rng);
+}
+
+// ============================================================================
+// Beer-Powder approximation (Schneider/Horizon Zero Dawn)
+// Simulates darkening at cloud edges from out-scattering of multiply-scattered light
+// ============================================================================
+__host__ __device__ inline float beer_powder(float optical_depth) {
+	float beer = expf(-optical_depth);
+	float powder = 1.0f - expf(-2.0f * optical_depth);
+	return 2.0f * beer * powder;
+}
+
 inline __host__ __device__ float fractf(float x) {
 	return x - floorf(x);
 }

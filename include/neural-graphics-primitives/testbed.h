@@ -446,6 +446,8 @@ public:
 	void mouse_wheel();
 	void load_file(const fs::path& path);
 	void set_nerf_camera_matrix(const mat4x3& cam);
+	void set_camera_to_goes_east_view(float lat_deg, float lon_deg);
+	void set_camera_to_top_down_view();
 	vec3 look_at() const;
 	void set_look_at(const vec3& pos);
 	float scale() const { return m_scale; }
@@ -977,9 +979,52 @@ public:
 	};
 
 	struct Volume {
-		float albedo = 0.95f;
-		float scattering = 0.f;
+		// --- Master physics toggle (false = original rendering for A/B comparison) ---
+		bool  enable_physics = true;
+
+		// --- Physics-in-the-loop: network predicts material params (albedo, g, w_g1),
+		//     renderer evaluates RTE at render time. Enables relighting & material editing.
+		//     When false (legacy): network predicts pre-baked radiance (RGB). ---
+		bool  physics_in_the_loop = false;
+
+		// --- Hydrometeor mix fractions [water, ice, snow, graupel] ---
+		// Auto-set from NanoVDB grid names on load. Must sum to 1.0.
+		float phase_fractions[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+		bool  fractions_from_file = false; // true if auto-detected from .nvdb
+
+		// --- Overrides (when > 0 these replace the blended value) ---
+		float albedo_override = 0.0f;    // 0 = use blended, otherwise override
+		float g_override      = 0.0f;    // 0 = use blended HG g
+
+		// Legacy parameters (kept for backward compat; derived from blend if not overridden)
+		float albedo = 0.9999f;
+		float scattering = 0.85f;        // now interpreted as HG g parameter
 		float inv_distance_scale = 100.f;
+
+		// --- Sun / direct lighting ---
+		float sun_intensity   = 20.0f;   // multiplier on sun radiance
+		int   shadow_steps    = 32;      // steps for shadow ray march toward sun
+		bool  enable_direct_light = true;
+
+		// --- Multi-scattering (Frostbite octave method) ---
+		int   ms_octaves      = 4;       // number of scattering octaves
+		float ms_attenuation  = 0.5f;    // per-octave extinction/phase attenuation
+
+		// --- Beer-Powder edge darkening ---
+		bool  enable_beer_powder = true;
+
+		// --- Phase function mode ---
+		bool  use_dual_lobe   = true;    // true = dual-lobe HG, false = single-lobe
+
+		// --- Species auto-detection (from NanoVDB grid name) ---
+		std::string detected_species_name; // for display in UI
+
+		// --- Satellite view matching (GOES-East) ---
+		float sat_roi_lat = 40.35f;       // ROI center latitude (degrees)
+		float sat_roi_lon = -74.65f;      // ROI center longitude (degrees)
+		float sat_zenith_deg = 0.0f;      // computed: viewing zenith angle
+		float sat_azimuth_deg = 0.0f;     // computed: viewing azimuth from N
+
 		GPUMemory<char> nanovdb_grid;
 		GPUMemory<uint8_t> bitgrid;
 		float global_majorant = 1.f;
@@ -989,6 +1034,9 @@ public:
 		struct Training {
 			GPUMemory<vec3> positions = {};
 			GPUMemory<vec4> targets = {};
+			// Physics-in-the-loop: per-vertex auxiliary data for differentiable physics
+			// (T_sun, cos_theta, gt_density, padding)
+			GPUMemory<vec4> physics_aux = {};
 		} training = {};
 
 		// tracing state
